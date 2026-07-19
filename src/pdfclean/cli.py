@@ -1,32 +1,97 @@
-"""Command Line Interface for PDFClean Pro."""
+"""
+PDFClean Pro - Command Line Interface.
+"""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import click
 from rich.console import Console
+from rich.panel import Panel
+
+from pdfclean.version import VERSION
 
 console = Console()
 
 
-@click.group()
-@click.version_option(version="0.1.0", prog_name="PDFClean Pro")
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.version_option(
+    VERSION.string,
+    "--version",
+    "-V",
+    prog_name="PDFClean Pro",
+)
 def app() -> None:
-    """PDFClean Pro - Intelligent PDF Cleaner."""
-    pass
+    """
+    PDFClean Pro.
+
+    Automatic removal of headers, footers and page numbers
+    from ENI PDF books.
+    """
 
 
 @app.command()
-@click.argument("pdf", required=False)
-def analyse(pdf: str | None) -> None:
-    """Analyse un document PDF."""
-    if pdf is None:
-        console.print("[yellow]Aucun fichier fourni.[/yellow]")
-        return
+@click.argument(
+    "pdf_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+def analyse(pdf_file: Path) -> None:
+    """
+    Analyse a PDF document.
+    """
 
-    console.print(f"[green]Analyse du fichier :[/green] {pdf}")
+    console.print()
+
+    console.print(
+        Panel.fit(
+            "[bold cyan]PDFClean Pro[/bold cyan]\n"
+            f"Version {VERSION.string}",
+            title="Analysis",
+        )
+    )
+
+    console.print(f"[green]Input file[/green] : {pdf_file}")
+    console.print("[yellow]Analysis engine not implemented yet.[/yellow]")
 
 
 @app.command()
-def version() -> None:
-    """Affiche la version."""
-    console.print("[bold cyan]PDFClean Pro v0.1.0[/bold cyan]")
+@click.argument(
+    "pdf_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+def clean(pdf_file: Path) -> None:
+    """
+    Clean a PDF document.
+    """
+
+    console.print()
+
+    console.print(
+        Panel.fit(
+            "[bold cyan]PDFClean Pro[/bold cyan]\n"
+            f"Version {VERSION.string}",
+            title="Cleaning",
+        )
+    )
+
+    console.print(f"[green]Input file[/green] : {pdf_file}")
+    console.print("[yellow]Cleaning engine not implemented yet.[/yellow]")
+
+
+@app.command(name="info")
+def info_command() -> None:
+    """
+    Display application information.
+    """
+
+    console.print()
+
+    console.print(
+        Panel.fit(
+            f"[bold]PDFClean Pro[/bold]\n"
+            f"Version : {VERSION.string}\n"
+            "Target : ENI PDF books",
+            title="Information",
+        )
+    )
