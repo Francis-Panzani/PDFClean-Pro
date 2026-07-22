@@ -11,6 +11,7 @@ from collections import OrderedDict
 from pdfclean.detector.fingerprint import Fingerprint
 from pdfclean.pdf.text_block import TextBlock
 
+import re
 
 class FingerprintEngine:
     """
@@ -19,15 +20,40 @@ class FingerprintEngine:
     This class does NOT decide whether a block is a header,
     footer or page number. It only groups repeated blocks.
     """
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """
+        Normalize text before fingerprinting.
 
+        This allows variable page numbers such as:
+
+            - 1 -
+            - 2 -
+            Page 12
+
+        to be grouped together.
+        """
+
+        text = text.strip()
+
+        #
+        # Replace every sequence of digits by '#'
+        #
+        text = re.sub(r"\d+", "#", text)
+
+        #
+        # Collapse multiple spaces
+        #
+        text = re.sub(r"\s+", " ", text)
+
+        return text
     def __init__(self) -> None:
         self._fingerprints: OrderedDict[
             tuple[str, int, int],
             Fingerprint,
         ] = OrderedDict()
 
-    @staticmethod
-    def _build_key(block: TextBlock) -> tuple[str, int, int]:
+    def _build_key(self, block: TextBlock) -> tuple[str, int, int]:
         """
         Build a grouping key.
 
@@ -42,7 +68,7 @@ class FingerprintEngine:
         """
 
         return (
-            block.text.strip(),
+            self._normalize_text(block.text),
             round(block.y0),
             round(block.height),
         )
