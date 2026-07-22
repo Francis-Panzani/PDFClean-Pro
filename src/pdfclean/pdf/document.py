@@ -11,6 +11,8 @@ import fitz
 from pdfclean.exceptions import PDFOpenError
 from pdfclean.exceptions import PDFSaveError
 
+from pdfclean.pdf.extractor import TextExtractor
+from pdfclean.pdf.text_block import TextBlock
 
 class PDFDocument:
     """
@@ -81,7 +83,26 @@ class PDFDocument:
 
         self._document.close()
         self._document = None
+        
+    def extract_text_blocks(self) -> list[TextBlock]:
+        """
+        Extract all text blocks from the document.
 
+        Returns
+        -------
+        list[TextBlock]
+            List of extracted text blocks.
+
+        Raises
+        ------
+        PDFOpenError
+            If the document is not open.
+        """
+        if self._document is None:
+            raise PDFOpenError("Document is not open.")
+
+        return TextExtractor.extract(self._document)
+    
     def save_copy(self, output_path: str | Path) -> None:
         """
         Save a copy of the document.
@@ -109,3 +130,4 @@ class PDFDocument:
         traceback,
     ) -> None:
         self.close()
+      
