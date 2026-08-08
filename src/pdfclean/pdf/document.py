@@ -27,6 +27,13 @@ class PDFDocument:
         self._document: fitz.Document | None = None
 
     @property
+    def document(self) -> fitz.Document | None:
+        """
+        Return underlying PyMuPDF document.
+        """
+        return self._document
+
+    @property
     def path(self) -> Path:
         """
         Return PDF path.

@@ -17,11 +17,13 @@ class FooterDetector:
     # Position minimale (en points PDF) pour considérer
     # qu'un bloc est un pied de page.
     #
+    #: Minimum Y coordinate (PDF points) for a footer.
     MIN_FOOTER_Y = 700.0
 
     #
     # Nombre minimum d'occurrences.
     #
+    #: Minimum number of occurrences to consider a repeated block.
     MIN_OCCURRENCES = 2
 
     def detect(

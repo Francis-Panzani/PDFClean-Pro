@@ -104,7 +104,7 @@ class PDFCleaner:
         pdf: PDFDocument,
     ) -> None:
         """
-        Apply all cleaning regions using PDF redactions.
+        Apply all cleaning regions to the PDF.
         """
 
         if pdf.document is None:
@@ -123,11 +123,9 @@ class PDFCleaner:
                 region.y1,
             )
 
-            page.add_redact_annot(rect)
-
-        #
-        # Apply page by page.
-        #
-        for page in document:
-            page.apply_redactions()
-
+            page.draw_rect(
+                rect,
+                color=None,
+                fill=(1, 1, 1),
+                overlay=True,
+            )

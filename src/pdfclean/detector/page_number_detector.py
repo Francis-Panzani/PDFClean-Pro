@@ -36,12 +36,10 @@ class PageNumberDetector:
     # Supported page number patterns
     #
     PATTERNS = (
-        r"^\d+$",
-        r"^-\s*\d+\s*-$",
-        r"^Page\s+\d+$",
-        r"^page\s+\d+$",
-        r"^P\.\s*\d+$",
-        r"^p\.\s*\d+$",
+        re.compile(r"^\d+$"),
+        re.compile(r"^-\s*\d+\s*-$"),
+        re.compile(r"^Page\s+\d+$", re.IGNORECASE),
+        re.compile(r"^P\.\s*\d+$", re.IGNORECASE),
     )
 
     def detect(
@@ -62,13 +60,13 @@ class PageNumberDetector:
             if fingerprint.y0 < self.MIN_Y:
                 continue
 
-            text = fingerprint.text.strip()
+            text = fingerprint.text.strip().splitlines()[-1].strip()
 
             if not text:
                 continue
 
             if any(
-                re.fullmatch(pattern, text)
+                pattern.fullmatch(text)
                 for pattern in self.PATTERNS
             ):
                 numbers.append(PageNumber(fingerprint))

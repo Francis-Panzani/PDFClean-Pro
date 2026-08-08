@@ -28,7 +28,15 @@ class Footer:
     @property
     def y1(self) -> float:
         return self.fingerprint.y1
+    #patch minimal
+    @property
+    def x0(self) -> float:
+        return self.fingerprint.x0
+    @property
+    def x1(self) -> float:
+        return self.fingerprint.x1
 
+    
     @property
     def pages(self) -> list[int]:
         return self.fingerprint.pages

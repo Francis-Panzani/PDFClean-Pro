@@ -13,6 +13,10 @@ from pdfclean.pdf.text_block import TextBlock
 
 import re
 
+FingerprintKey = tuple[str, int, int]
+_DIGITS_RE = re.compile(r"\d+")
+_SPACES_RE = re.compile(r"\s+")
+
 class FingerprintEngine:
     """
     Detect repeated text blocks.
@@ -20,6 +24,9 @@ class FingerprintEngine:
     This class does NOT decide whether a block is a header,
     footer or page number. It only groups repeated blocks.
     """
+    _POSITION_TOLERANCE = 2.0
+    _HEIGHT_TOLERANCE = 2.0
+
     @staticmethod
     def _normalize_text(text: str) -> str:
         """
@@ -39,19 +46,19 @@ class FingerprintEngine:
         #
         # Replace every sequence of digits by '#'
         #
-        text = re.sub(r"\d+", "#", text)
+        text = _DIGITS_RE.sub("#", text)
 
         #
         # Collapse multiple spaces
         #
-        text = re.sub(r"\s+", " ", text)
+        text = _SPACES_RE.sub(" ", text)
 
         return text
     def __init__(self) -> None:
         self._fingerprints: OrderedDict[
-            tuple[str, int, int],
+            FingerprintKey,
             Fingerprint,
-        ] = OrderedDict()
+        ]= OrderedDict()
 
     def _build_key(self, block: TextBlock) -> tuple[str, int, int]:
         """
@@ -66,11 +73,26 @@ class FingerprintEngine:
         Horizontal position will be analysed later by the
         detector modules.
         """
+        ## temporary debug print
+        # key = (
+        #     self._normalize_text(block.text),
+        #     round(block.y0 / self._POSITION_TOLERANCE),
+        #     round(block.height / self._HEIGHT_TOLERANCE),
+        # )
 
+        # if "- #" in key[0]:
+        #     print(key)
+
+        # return key
+
+        ### temporary debug print
+        # print(
+        #     f"{block.text!r} -> {self._normalize_text(block.text)!r}"
+        # )
         return (
             self._normalize_text(block.text),
-            round(block.y0),
-            round(block.height),
+            round(block.y0 / self._POSITION_TOLERANCE),
+            round(block.height / self._HEIGHT_TOLERANCE),
         )
 
     def analyse(
@@ -101,6 +123,9 @@ class FingerprintEngine:
                 continue
 
             key = self._build_key(block)
+            ## temporary debug print
+            # print(repr(key))
+
 
             if key not in self._fingerprints:
 
@@ -116,6 +141,13 @@ class FingerprintEngine:
 
             self._fingerprints[key].add_page(block.page)
 
+
+        ## temporary debug print
+       # print(f"Nombre de fingerprints : {len(self._fingerprints)}")
+
+        for fp in self._fingerprints.values():
+            if "- #" in fp.text:
+                print(fp)
         return list(self._fingerprints.values())
 
     def clear(self) -> None:

@@ -31,7 +31,15 @@ class Header:
     def y1(self) -> float:
         """Bottom coordinate."""
         return self.fingerprint.y1
-
+    @property
+    #rajout
+    def x0(self) -> float:
+        return self.fingerprint.x0
+    #patch min
+    @property
+    def x1(self) -> float:
+        return self.fingerprint.x1
+    
     @property
     def pages(self) -> list[int]:
         """Pages where the header appears."""
