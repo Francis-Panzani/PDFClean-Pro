@@ -1,11 +1,12 @@
-from typer.testing import CliRunner
+from click.testing import CliRunner
 
-from pdfclean.__main__ import app
+from pdfclean.cli import app
 
 
-def test_help_output_includes_clean_command() -> None:
+def test_help() -> None:
     runner = CliRunner()
+
     result = runner.invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    assert "clean" in result.stdout.lower()
+    assert "PDFClean Pro" in result.output
