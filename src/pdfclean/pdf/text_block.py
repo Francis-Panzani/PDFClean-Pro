@@ -1,7 +1,5 @@
 """
 PDFClean Pro - Text block model.
-
-Represents a text block extracted from a PDF page.
 """
 
 from __future__ import annotations
@@ -12,28 +10,7 @@ from dataclasses import dataclass
 @dataclass(slots=True, frozen=True)
 class TextBlock:
     """
-    Represents a text block extracted from a PDF.
-
-    Attributes
-    ----------
-    page:
-        Page number (0-based).
-    block_no:
-        Block index within the page.
-    x0:
-        Left coordinate.
-    y0:
-        Top coordinate.
-    x1:
-        Right coordinate.
-    y1:
-        Bottom coordinate.
-    text:
-        Extracted text.
-    block_type:
-        PyMuPDF block type.
-        0 = text
-        1 = image
+    Represents a text block extracted from a PDF page.
     """
 
     page: int
@@ -48,6 +25,26 @@ class TextBlock:
 
     block_type: int
 
+    font_size: float = 0.0
+    font_name: str = ""
+    is_bold: bool = False
+
+    line_count: int = 0
+
+    # ------------------------------------------------------------
+    # Graphic information
+    # ------------------------------------------------------------
+
+    has_background: bool = False
+
+    background_color: tuple[
+        float,
+        float,
+        float,
+    ] | None = None
+
+    background_coverage: float = 0.0
+
     @property
     def width(self) -> float:
         """Return block width."""
@@ -57,6 +54,11 @@ class TextBlock:
     def height(self) -> float:
         """Return block height."""
         return self.y1 - self.y0
+
+    @property
+    def area(self) -> float:
+        """Return block area."""
+        return self.width * self.height
 
     @property
     def is_text(self) -> bool:
@@ -70,15 +72,55 @@ class TextBlock:
 
     @property
     def is_empty(self) -> bool:
-        """Return True if the text is empty or whitespace."""
+        """Return True if the text is empty."""
         return self.text.strip() == ""
 
-    def as_tuple(self) -> tuple:
-        """
-        Return a tuple representation.
 
-        Useful for debugging and future comparisons.
+    @property
+    def is_grey_background(self) -> bool:
         """
+        Return True when the block is covered by a genuine
+        grey background.
+
+        White is explicitly excluded.
+        """
+
+        if not self.has_background:
+            return False
+
+        if self.background_color is None:
+            return False
+
+        r, g, b = self.background_color
+
+        # --------------------------------------------------------
+        # Ignore white backgrounds.
+        # --------------------------------------------------------
+
+        if (
+            r >= 0.95
+            and g >= 0.95
+            and b >= 0.95
+        ):
+            return False
+
+        # --------------------------------------------------------
+        # Grey means RGB components are close together.
+        # --------------------------------------------------------
+
+        grey_distance = (
+            max(r, g, b)
+            - min(r, g, b)
+        )
+
+        return (
+            grey_distance <= 0.08
+            and self.background_coverage >= 0.50
+        )
+
+    def as_tuple(self) -> tuple:
+        """Return tuple representation."""
+
         return (
             self.page,
             self.block_no,
@@ -88,16 +130,29 @@ class TextBlock:
             self.y1,
             self.text,
             self.block_type,
+            self.font_size,
+            self.font_name,
+            self.is_bold,
+            self.line_count,
+            self.has_background,
+            self.background_color,
+            self.background_coverage,
         )
 
     def __str__(self) -> str:
-        preview = self.text.replace("\n", " ")
+        preview = self.text.replace(
+            "\n",
+            " ",
+        )
 
         if len(preview) > 60:
             preview = preview[:57] + "..."
 
         return (
-            f"TextBlock(page={self.page}, "
+            f"TextBlock("
+            f"page={self.page}, "
             f"block={self.block_no}, "
+            f"size={self.font_size:.1f}, "
+            f"background={self.has_background}, "
             f"text='{preview}')"
         )
