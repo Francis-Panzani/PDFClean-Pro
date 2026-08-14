@@ -1,5 +1,8 @@
 """
 PDFClean Pro - Space optimization engine.
+
+Compact excessive vertical whitespace while preserving text
+as native PDF text.
 """
 
 from __future__ import annotations
@@ -16,10 +19,36 @@ from pdfclean.detector.title import TitleDetector
 
 
 @dataclass(slots=True)
-class SpaceBand:
-    """Non-overlapping vertical band extracted from a source page."""
+class TextItem:
+    """
+    Native text item extracted from a PDF.
+
+    Text is stored with its visual information so it can be
+    reinserted as real PDF text.
+    """
 
     source_page: int
+
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    text: str
+
+    font: str
+    size: float
+    color: tuple[float, float, float]
+
+
+@dataclass(slots=True)
+class SpaceBand:
+    """
+    Non-overlapping vertical band extracted from a source page.
+    """
+
+    source_page: int
+
     y0: float
     y1: float
 
@@ -30,11 +59,15 @@ class SpaceBand:
 
 @dataclass(slots=True)
 class OutputBand:
-    """Band placed on an output page."""
+    """
+    Band placed on an output page.
+    """
 
     source_page: int
+
     source_y0: float
     source_y1: float
+
     target_y0: float
     target_y1: float
 
@@ -47,30 +80,19 @@ class SpaceEngine:
     """
     Compact excessive vertical whitespace in a PDF.
 
-    The source PDF is never modified.
+    The source document is never modified.
 
-    Content is moved using non-overlapping vertical bands.
+    Unlike the previous implementation, text is not converted
+    into images. Text is extracted and reinserted as native
+    PDF text.
     """
 
     TOP_MARGIN = 48.0
     BOTTOM_MARGIN = 48.0
 
-    # ------------------------------------------------------------
-    # White-space rules
-    # ------------------------------------------------------------
-
-    # Petit espace : on le considère comme faisant partie
-    # du même bloc visuel.
     BAND_MERGE_GAP = 12.0
-
-    # Grand espace : peut devenir une vraie coupure.
-    MIN_GAP = 25.0
-
-    # Espace entre deux bandes réellement conservées.
-    BLOCK_SPACING = 0.0
-
-    # Une petite marge supplémentaire autour du contenu.
     CONTENT_PADDING = 1.0
+    BLOCK_SPACING = 0.0
 
     def __init__(self) -> None:
         self._pages_created = 0
@@ -94,7 +116,7 @@ class SpaceEngine:
         output_path: str | Path,
     ) -> None:
         """
-        Reflow the PDF and save the result.
+        Compact the PDF and save the result.
         """
 
         if document.document is None:
@@ -104,17 +126,12 @@ class SpaceEngine:
 
         blocks = TextExtractor.extract(source)
 
-        # --------------------------------------------------------
-        # Detect titles once.
-        # --------------------------------------------------------
-
         title_detector = TitleDetector(blocks)
         titles = title_detector.detect()
 
         page_bands = self._build_page_bands(
             source,
             blocks,
-            titles,
         )
 
         output_bands = self._build_output_flow(
@@ -123,9 +140,12 @@ class SpaceEngine:
             titles,
         )
 
+        text_items = self._extract_text_items(source)
+
         self._write_output(
             source,
             output_bands,
+            text_items,
             output_path,
         )
 
@@ -137,18 +157,17 @@ class SpaceEngine:
         self,
         document: fitz.Document,
         blocks: list[TextBlock],
-        titles,
     ) -> list[list[SpaceBand]]:
         """
-        Build compact vertical bands.
-
-        Important:
-        A page is never duplicated.
+        Build meaningful content bands.
         """
 
         page_blocks: dict[int, list[TextBlock]] = {}
 
         for block in blocks:
+
+            if not block.is_text:
+                continue
 
             if block.is_empty:
                 continue
@@ -182,41 +201,24 @@ class SpaceEngine:
                 )
             )
 
-            page_titles = [
-                title
-                for title in titles
-                if title.page == page_number
-            ]
-
-            bands = self._make_bands(
-                page_number,
-                page.rect.height,
-                blocks_on_page,
-                page_titles,
+            result.append(
+                self._make_bands(
+                    page_number,
+                    page.rect.height,
+                    blocks_on_page,
+                )
             )
 
-            result.append(bands)
-
         return result
-
-    # ============================================================
-    # BAND CREATION
-    # ============================================================
 
     def _make_bands(
         self,
         page_number: int,
         page_height: float,
         blocks: list[TextBlock],
-        titles,
     ) -> list[SpaceBand]:
         """
-        Convert blocks into a small number of meaningful
-        vertical bands.
-
-        The important difference with the previous version is
-        that small gaps between text blocks do NOT generate
-        independent PDF objects.
+        Merge vertically close text blocks into content bands.
         """
 
         if not blocks:
@@ -236,12 +238,10 @@ class SpaceEngine:
                 block.y1 + self.CONTENT_PADDING,
             )
 
-            if y1 <= y0:
-                continue
-
-            intervals.append(
-                (y0, y1)
-            )
+            if y1 > y0:
+                intervals.append(
+                    (y0, y1)
+                )
 
         if not intervals:
             return []
@@ -253,22 +253,12 @@ class SpaceEngine:
         for y0, y1 in intervals:
 
             if not merged:
-                merged.append(
-                    [y0, y1]
-                )
+                merged.append([y0, y1])
                 continue
 
             previous = merged[-1]
 
             gap = y0 - previous[1]
-
-            # ----------------------------------------------------
-            # IMPORTANT
-            #
-            # Small gaps remain inside ONE band.
-            # This avoids creating dozens of show_pdf_page()
-            # objects for one paragraph/page.
-            # ----------------------------------------------------
 
             if gap <= self.BAND_MERGE_GAP:
 
@@ -283,28 +273,15 @@ class SpaceEngine:
                     [y0, y1]
                 )
 
-        # --------------------------------------------------------
-        # Now remove only genuinely unnecessary large spaces.
-        #
-        # A large gap is retained as a boundary between bands.
-        # --------------------------------------------------------
-
-        bands: list[SpaceBand] = []
-
-        for y0, y1 in merged:
-
-            if y1 <= y0:
-                continue
-
-            bands.append(
-                SpaceBand(
-                    source_page=page_number,
-                    y0=y0,
-                    y1=y1,
-                )
+        return [
+            SpaceBand(
+                source_page=page_number,
+                y0=y0,
+                y1=y1,
             )
-
-        return bands
+            for y0, y1 in merged
+            if y1 > y0
+        ]
 
     # ============================================================
     # OUTPUT FLOW
@@ -317,28 +294,20 @@ class SpaceEngine:
         titles,
     ) -> list[list[OutputBand]]:
         """
-        Move bands into a compact output flow.
-
-        Titles representing major sections are forced onto a
-        new page when required by TitleDetector.
+        Calculate the new position of every content band.
         """
 
         if document.page_count == 0:
             return []
 
-        page_width = document[0].rect.width
         page_height = document[0].rect.height
 
         output_pages: list[list[OutputBand]] = []
-
         current_page: list[OutputBand] = []
 
         cursor = self.TOP_MARGIN
 
         for source_page, bands in enumerate(pages):
-
-            if not bands:
-                continue
 
             page_titles = [
                 title
@@ -346,16 +315,10 @@ class SpaceEngine:
                 if title.page == source_page
             ]
 
-            for band_index, band in enumerate(bands):
+            for band in bands:
 
-                band_height = band.height
-
-                if band_height <= 0:
+                if band.height <= 0:
                     continue
-
-                # ------------------------------------------------
-                # Determine whether a title occurs in this band.
-                # ------------------------------------------------
 
                 band_titles = [
                     title
@@ -367,81 +330,54 @@ class SpaceEngine:
                 ]
 
                 force_new_page = any(
-                    self._title_requires_new_page(title)
+                    self._title_requires_new_page(
+                        title,
+                        source_page,
+                    )
                     for title in band_titles
                 )
-
-                # ------------------------------------------------
-                # Major title -> new page.
-                #
-                # We don't do this for every subsection.
-                # ------------------------------------------------
 
                 if (
                     force_new_page
                     and current_page
                 ):
-                    output_pages.append(
-                        current_page
-                    )
-
+                    output_pages.append(current_page)
                     current_page = []
-
                     cursor = self.TOP_MARGIN
 
-                # ------------------------------------------------
-                # Normal overflow.
-                # ------------------------------------------------
-
                 if (
-                    cursor + band_height
+                    cursor + band.height
                     > page_height - self.BOTTOM_MARGIN
                 ):
 
                     if current_page:
-                        output_pages.append(
-                            current_page
-                        )
+                        output_pages.append(current_page)
 
                     current_page = []
-
                     cursor = self.TOP_MARGIN
 
-                target_y0 = cursor
-
-                target_y1 = (
-                    cursor
-                    + band_height
+                output_band = OutputBand(
+                    source_page=band.source_page,
+                    source_y0=band.y0,
+                    source_y1=band.y1,
+                    target_y0=cursor,
+                    target_y1=cursor + band.height,
                 )
 
-                current_page.append(
-                    OutputBand(
-                        source_page=band.source_page,
-                        source_y0=band.y0,
-                        source_y1=band.y1,
-                        target_y0=target_y0,
-                        target_y1=target_y1,
-                    )
-                )
+                current_page.append(output_band)
 
-                if (
-                    abs(
-                        band.y0
-                        - target_y0
-                    )
-                    > 1.0
-                ):
+                if abs(
+                    band.y0 - cursor
+                ) > 1.0:
                     self._blocks_moved += 1
 
                 cursor = (
-                    target_y1
+                    output_band.target_y1
                     + self.BLOCK_SPACING
                 )
 
         if current_page:
-            output_pages.append(
-                current_page
-            )
+            output_pages.append(current_page)
 
         return output_pages
 
@@ -454,9 +390,6 @@ class SpaceEngine:
         title,
         band: SpaceBand,
     ) -> bool:
-        """
-        Determine whether a title belongs to a source band.
-        """
 
         try:
             title_y0 = title.block.y0
@@ -474,45 +407,167 @@ class SpaceEngine:
         title,
     ) -> bool:
         """
-        Decide whether a detected title starts a new major section.
+        Current ENI rule:
 
-        Rules used for the current ENI document:
-
-        - level 1 => new page
-        - level 2 => normally stays on the current page
-        - short subsection headings do not force a new page
+        Level 1 titles start a new page.
+        Level 2 titles remain with their content.
         """
 
-        try:
-            level = title.level
-        except AttributeError:
-            return False
+        return getattr(
+            title,
+            "level",
+            0,
+        ) == 1
 
-        return level == 1
+    # ============================================================
+    # TEXT EXTRACTION
+    # ============================================================
+
+    def _extract_text_items(
+        self,
+        document: fitz.Document,
+    ) -> list[TextItem]:
+        """
+        Extract native text spans.
+
+        page.get_text("dict") gives access to lines and spans,
+        including text, font, size, colour and coordinates.
+        """
+
+        items: list[TextItem] = []
+
+        for page_number, page in enumerate(document):
+
+            data = page.get_text("dict")
+
+            for block in data.get("blocks", []):
+
+                if block.get("type") != 0:
+                    continue
+
+                for line in block.get("lines", []):
+
+                    for span in line.get("spans", []):
+
+                        text = span.get(
+                            "text",
+                            "",
+                        )
+
+                        if not text:
+                            continue
+
+                        bbox = span.get("bbox")
+
+                        if not bbox:
+                            continue
+
+                        x0, y0, x1, y1 = bbox
+
+                        size = float(
+                            span.get(
+                                "size",
+                                10.0,
+                            )
+                        )
+
+                        font = str(
+                            span.get(
+                                "font",
+                                "helv",
+                            )
+                        )
+
+                        color = self._pdf_color_to_rgb(
+                            span.get(
+                                "color",
+                                0,
+                            )
+                        )
+
+                        items.append(
+                            TextItem(
+                                source_page=page_number,
+                                x0=float(x0),
+                                y0=float(y0),
+                                x1=float(x1),
+                                y1=float(y1),
+                                text=text,
+                                font=font,
+                                size=size,
+                                color=color,
+                            )
+                        )
+
+        return items
+
+    def _pdf_color_to_rgb(
+        self,
+        value,
+    ) -> tuple[float, float, float]:
+        """
+        Convert PyMuPDF integer colour to RGB floats.
+        """
+
+        if isinstance(value, int):
+
+            r = (
+                (value >> 16) & 255
+            ) / 255.0
+
+            g = (
+                (value >> 8) & 255
+            ) / 255.0
+
+            b = (
+                value & 255
+            ) / 255.0
+
+            return (
+                r,
+                g,
+                b,
+            )
+
+        return (
+            0.0,
+            0.0,
+            0.0,
+        )
 
     # ============================================================
     # OUTPUT
     # ============================================================
-   
+
     def _write_output(
         self,
         source: fitz.Document,
         pages: list[list[OutputBand]],
+        text_items: list[TextItem],
         output_path: str | Path,
     ) -> None:
         """
-        Write the compacted PDF.
+        Create the output PDF.
 
-        Each source band is rendered independently before being inserted
-        into the output document.
-
-        This avoids duplicated hidden PDF objects caused by repeated
-        show_pdf_page(..., clip=...).
+        Text is inserted as actual PDF text.
+        No PNG conversion is performed.
         """
 
         output = fitz.open()
 
         try:
+
+            items_by_page: dict[
+                int,
+                list[TextItem],
+            ] = {}
+
+            for item in text_items:
+
+                items_by_page.setdefault(
+                    item.source_page,
+                    [],
+                ).append(item)
 
             for page_bands in pages:
 
@@ -523,73 +578,75 @@ class SpaceEngine:
 
                 for band in page_bands:
 
-                    source_page = source[
-                        band.source_page
-                    ]
-
-                    band_height = (
-                        band.source_y1
-                        - band.source_y0
+                    items = items_by_page.get(
+                        band.source_page,
+                        [],
                     )
 
-                    if band_height <= 0:
-                        continue
+                    for item in items:
 
-                    source_rect = fitz.Rect(
-                        0,
-                        band.source_y0,
-                        source_page.rect.width,
-                        band.source_y1,
-                    )
+                        # Item must belong to the current band.
+                        if (
+                            item.y1 < band.source_y0
+                            or item.y0 > band.source_y1
+                        ):
+                            continue
 
-                    target_rect = fitz.Rect(
-                        0,
-                        band.target_y0,
-                        source_page.rect.width,
-                        band.target_y1,
-                    )
+                        # ------------------------------------------------
+                        # Calculate vertical translation.
+                        # ------------------------------------------------
 
-                    # ------------------------------------------------
-                    # Render only the actual source band.
-                    #
-                    # A higher resolution is used to preserve the
-                    # visual quality of text, images and diagrams.
-                    # ------------------------------------------------
-
-                    matrix = fitz.Matrix(
-                        2.0,
-                        2.0,
-                    )
-
-                    pixmap = source_page.get_pixmap(
-                        matrix=matrix,
-                        clip=source_rect,
-                        alpha=False,
-                    )
-
-                    image_bytes = pixmap.tobytes(
-                        "png"
-                    )
-
-                    # ------------------------------------------------
-                    # Insert exactly one visible object.
-                    # ------------------------------------------------
-
-                    target_page.insert_image(
-                        target_rect,
-                        stream=image_bytes,
-                        keep_proportion=False,
-                        overlay=True,
-                    )
-
-                    if (
-                        abs(
-                            band.source_y0
-                            - band.target_y0
+                        y_offset = (
+                            band.target_y0
+                            - band.source_y0
                         )
-                        > 1.0
-                    ):
-                        self._blocks_moved += 1
+
+                        target_x = item.x0
+
+                        target_y = (
+                            item.y0
+                            + y_offset
+                        )
+
+                        # ------------------------------------------------
+                        # Try to reuse the original font.
+                        #
+                        # Standard fonts work directly. Embedded fonts may
+                        # not always be reusable under their PDF name.
+                        # ------------------------------------------------
+
+                        fontname = self._safe_font(
+                            item.font
+                        )
+
+                        try:
+
+                            target_page.insert_text(
+                                (
+                                    target_x,
+                                    target_y + item.size,
+                                ),
+                                item.text,
+                                fontsize=item.size,
+                                fontname=fontname,
+                                color=item.color,
+                                overlay=True,
+                            )
+
+                        except Exception:
+
+                            # Safe fallback keeps the text editable.
+                            target_page.insert_text(
+                                (
+                                    target_x,
+                                    target_y + item.size,
+                                ),
+                                item.text,
+                                fontsize=item.size,
+                                fontname="helv",
+                                color=item.color,
+                                overlay=True,
+                            )
 
             self._pages_created = len(output)
 
@@ -602,3 +659,37 @@ class SpaceEngine:
 
         finally:
             output.close()
+
+    def _safe_font(
+        self,
+        font: str,
+    ) -> str:
+        """
+        Map common PDF font names to built-in PyMuPDF fonts.
+
+        Unknown embedded fonts fall back to Helvetica.
+        """
+
+        name = font.lower()
+
+        if "times" in name:
+            return "tiro"
+
+        if (
+            "courier" in name
+            or "mono" in name
+        ):
+            return "cour"
+
+        if (
+            "helvetica" in name
+            or "arial" in name
+        ):
+            return "helv"
+
+        if "symbol" in name:
+            return "symb"
+
+        # Roboto and other embedded PDF fonts cannot reliably
+        # be referenced only by their PDF font name.
+        return "helv"
