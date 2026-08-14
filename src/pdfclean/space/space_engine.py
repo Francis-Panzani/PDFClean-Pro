@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
+from pdfclean.validator.pdf_validator import PDFValidator
 
 from pdfclean.pdf.document import PDFDocument
 from pdfclean.pdf.extractor import TextExtractor
@@ -76,6 +77,32 @@ class OutputBand:
         return self.source_y1 - self.source_y0
 
 
+@dataclass(slots=True)
+class GraphicItem:
+    """
+    Native graphical object extracted from a source page.
+    """
+
+    source_page: int
+
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    kind: str
+
+    image_bytes: bytes | None = None
+    image_ext: str | None = None
+
+    drawing: dict | None = None
+
+    @property
+    def center_y(self) -> float:
+        return (self.y0 + self.y1) / 2.0
+
+
+
 class SpaceEngine:
     """
     Compact excessive vertical whitespace in a PDF.
@@ -126,12 +153,41 @@ class SpaceEngine:
 
         blocks = TextExtractor.extract(source)
 
-        title_detector = TitleDetector(blocks)
+        validator = PDFValidator()
+
+        headers, footers, page_numbers = validator.validate(
+            document
+        )
+
+       
+
+        usable_blocks = [
+            block
+            for block in blocks
+            if not self._is_in_excluded_region(
+                block,
+                headers,
+                footers,
+                page_numbers,
+            )
+        ]
+
+        title_detector = TitleDetector(
+            usable_blocks
+        )
+
         titles = title_detector.detect()
 
         page_bands = self._build_page_bands(
             source,
-            blocks,
+            usable_blocks,
+        )
+
+        text_items = self._extract_text_items(
+            source,
+            headers,
+            footers,
+            page_numbers,
         )
 
         output_bands = self._build_output_flow(
@@ -139,8 +195,6 @@ class SpaceEngine:
             page_bands,
             titles,
         )
-
-        text_items = self._extract_text_items(source)
 
         self._write_output(
             source,
@@ -405,19 +459,34 @@ class SpaceEngine:
     def _title_requires_new_page(
         self,
         title,
+        source_page: int,
     ) -> bool:
         """
-        Current ENI rule:
+        Decide whether a title starts a new page.
 
-        Level 1 titles start a new page.
-        Level 2 titles remain with their content.
+        The first major title of the document stays on page 1.
+
+        Later level-1 titles start a new page.
         """
 
-        return getattr(
+        level = getattr(
             title,
             "level",
             0,
-        ) == 1
+        )
+
+        if level != 1:
+            return False
+
+        # --------------------------------------------------------
+        # SQL Server 2022 is the opening title of the document.
+        # It must not create an empty first page.
+        # --------------------------------------------------------
+
+        if source_page == 0:
+            return False
+
+        return True
 
     # ============================================================
     # TEXT EXTRACTION
@@ -426,12 +495,13 @@ class SpaceEngine:
     def _extract_text_items(
         self,
         document: fitz.Document,
+        headers,
+        footers,
+        page_numbers,
     ) -> list[TextItem]:
         """
-        Extract native text spans.
-
-        page.get_text("dict") gives access to lines and spans,
-        including text, font, size, colour and coordinates.
+        Extract native text spans while excluding headers,
+        footers and page numbers.
         """
 
         items: list[TextItem] = []
@@ -463,6 +533,26 @@ class SpaceEngine:
                             continue
 
                         x0, y0, x1, y1 = bbox
+
+                        # ------------------------------------------------
+                        # Ignore headers / footers / page numbers.
+                        # ------------------------------------------------
+
+                        span_rect = fitz.Rect(
+                            x0,
+                            y0,
+                            x1,
+                            y1,
+                        )
+
+                        if self._rect_in_excluded_region(
+                            page_number,
+                            span_rect,
+                            headers,
+                            footers,
+                            page_numbers,
+                        ):
+                            continue
 
                         size = float(
                             span.get(
@@ -500,6 +590,53 @@ class SpaceEngine:
                         )
 
         return items
+
+    def _rect_in_excluded_region(
+        self,
+        page_number: int,
+        rect: fitz.Rect,
+        headers,
+        footers,
+        page_numbers,
+    ) -> bool:
+        """
+        Return True when a rectangle belongs to a header,
+        footer or page-number region.
+        """
+
+        for item in (
+            *headers,
+            *footers,
+            *page_numbers,
+        ):
+
+            if page_number not in item.pages:
+                continue
+
+            fingerprint = getattr(
+                item,
+                "fingerprint",
+                None,
+            )
+
+            if fingerprint is None:
+                continue
+
+            excluded_rect = fitz.Rect(
+                fingerprint.x0,
+                fingerprint.y0,
+                fingerprint.x1,
+                fingerprint.y1,
+            )
+
+            if rect.intersects(
+                excluded_rect
+            ):
+                return True
+
+        return False
+
+
 
     def _pdf_color_to_rgb(
         self,
@@ -693,3 +830,30 @@ class SpaceEngine:
         # Roboto and other embedded PDF fonts cannot reliably
         # be referenced only by their PDF font name.
         return "helv"
+
+    def _is_in_excluded_region(
+        self,
+        block: TextBlock,
+        headers,
+        footers,
+        page_numbers,
+    ) -> bool:
+        """
+        Return True when a TextBlock belongs to a header,
+        footer or page-number region.
+        """
+
+        block_rect = fitz.Rect(
+            block.x0,
+            block.y0,
+            block.x1,
+            block.y1,
+        )
+
+        return self._rect_in_excluded_region(
+            block.page,
+            block_rect,
+            headers,
+            footers,
+            page_numbers,
+        )
