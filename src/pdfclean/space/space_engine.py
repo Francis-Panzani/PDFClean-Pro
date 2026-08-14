@@ -12,18 +12,12 @@ import fitz
 from pdfclean.pdf.document import PDFDocument
 from pdfclean.pdf.extractor import TextExtractor
 from pdfclean.pdf.text_block import TextBlock
-
-
-# ================================================================
-# DATA MODELS
-# ================================================================
+from pdfclean.detector.title import TitleDetector
 
 
 @dataclass(slots=True)
 class SpaceBand:
-    """
-    Vertical content band belonging to one source page.
-    """
+    """Non-overlapping vertical band extracted from a source page."""
 
     source_page: int
     y0: float
@@ -36,15 +30,11 @@ class SpaceBand:
 
 @dataclass(slots=True)
 class OutputBand:
-    """
-    Content band placed on an output page.
-    """
+    """Band placed on an output page."""
 
     source_page: int
-
     source_y0: float
     source_y1: float
-
     target_y0: float
     target_y1: float
 
@@ -53,41 +43,34 @@ class OutputBand:
         return self.source_y1 - self.source_y0
 
 
-# ================================================================
-# ENGINE
-# ================================================================
-
-
 class SpaceEngine:
     """
     Compact excessive vertical whitespace in a PDF.
 
     The source PDF is never modified.
 
-    Each source page is processed once.
-
-    Content is moved vertically while preserving the complete
-    horizontal page width.
+    Content is moved using non-overlapping vertical bands.
     """
 
     TOP_MARGIN = 48.0
     BOTTOM_MARGIN = 48.0
 
-    # Minimum empty vertical area considered removable.
+    # ------------------------------------------------------------
+    # White-space rules
+    # ------------------------------------------------------------
+
+    # Petit espace : on le considère comme faisant partie
+    # du même bloc visuel.
+    BAND_MERGE_GAP = 12.0
+
+    # Grand espace : peut devenir une vraie coupure.
     MIN_GAP = 25.0
 
-    # Space inserted between two compacted content areas.
-    BLOCK_SPACING = 4.0
+    # Espace entre deux bandes réellement conservées.
+    BLOCK_SPACING = 0.0
 
-    # A title of this size is considered a major section.
-    MAJOR_TITLE_SIZE = 20.0
-
-    # A smaller title is considered a subsection.
-    SUBTITLE_SIZE = 14.0
-
-    # A subsection can remain at the bottom if at least this many
-    # following text lines remain with it.
-    MIN_LINES_AFTER_SUBTITLE = 5
+    # Une petite marge supplémentaire autour du contenu.
+    CONTENT_PADDING = 1.0
 
     def __init__(self) -> None:
         self._pages_created = 0
@@ -95,16 +78,14 @@ class SpaceEngine:
 
     @property
     def pages_created(self) -> int:
-        """Return the number of generated pages."""
         return self._pages_created
 
     @property
     def blocks_moved(self) -> int:
-        """Return the number of moved content bands."""
         return self._blocks_moved
 
     # ============================================================
-    # PUBLIC API
+    # PUBLIC
     # ============================================================
 
     def apply(
@@ -113,7 +94,7 @@ class SpaceEngine:
         output_path: str | Path,
     ) -> None:
         """
-        Compact the PDF and save the result.
+        Reflow the PDF and save the result.
         """
 
         if document.document is None:
@@ -123,39 +104,46 @@ class SpaceEngine:
 
         blocks = TextExtractor.extract(source)
 
+        # --------------------------------------------------------
+        # Detect titles once.
+        # --------------------------------------------------------
+
+        title_detector = TitleDetector(blocks)
+        titles = title_detector.detect()
+
         page_bands = self._build_page_bands(
             source,
             blocks,
+            titles,
         )
 
-        output_pages = self._build_output_flow(
+        output_bands = self._build_output_flow(
             source,
             page_bands,
-            blocks,
+            titles,
         )
 
         self._write_output(
             source,
-            output_pages,
+            output_bands,
             output_path,
         )
 
     # ============================================================
-    # SOURCE ANALYSIS
+    # SOURCE BANDS
     # ============================================================
 
     def _build_page_bands(
         self,
         document: fitz.Document,
         blocks: list[TextBlock],
+        titles,
     ) -> list[list[SpaceBand]]:
         """
-        Build the occupied vertical bands of every page.
+        Build compact vertical bands.
 
-        A page is analysed only once.
-
-        The bands represent the complete vertical extent of the
-        page content, not individual text blocks.
+        Important:
+        A page is never duplicated.
         """
 
         page_blocks: dict[int, list[TextBlock]] = {}
@@ -163,9 +151,6 @@ class SpaceEngine:
         for block in blocks:
 
             if block.is_empty:
-                continue
-
-            if not block.is_text:
                 continue
 
             if block.width <= 0:
@@ -197,10 +182,17 @@ class SpaceEngine:
                 )
             )
 
+            page_titles = [
+                title
+                for title in titles
+                if title.page == page_number
+            ]
+
             bands = self._make_bands(
                 page_number,
                 page.rect.height,
                 blocks_on_page,
+                page_titles,
             )
 
             result.append(bands)
@@ -216,11 +208,15 @@ class SpaceEngine:
         page_number: int,
         page_height: float,
         blocks: list[TextBlock],
+        titles,
     ) -> list[SpaceBand]:
         """
-        Merge overlapping text blocks into vertical bands.
+        Convert blocks into a small number of meaningful
+        vertical bands.
 
-        Only occupied areas are returned.
+        The important difference with the previous version is
+        that small gaps between text blocks do NOT generate
+        independent PDF objects.
         """
 
         if not blocks:
@@ -232,22 +228,19 @@ class SpaceEngine:
 
             y0 = max(
                 0.0,
-                block.y0,
+                block.y0 - self.CONTENT_PADDING,
             )
 
             y1 = min(
                 page_height,
-                block.y1,
+                block.y1 + self.CONTENT_PADDING,
             )
 
             if y1 <= y0:
                 continue
 
             intervals.append(
-                (
-                    y0,
-                    y1,
-                )
+                (y0, y1)
             )
 
         if not intervals:
@@ -261,17 +254,23 @@ class SpaceEngine:
 
             if not merged:
                 merged.append(
-                    [
-                        y0,
-                        y1,
-                    ]
+                    [y0, y1]
                 )
                 continue
 
             previous = merged[-1]
 
-            # Merge overlapping or touching intervals.
-            if y0 <= previous[1] + 2.0:
+            gap = y0 - previous[1]
+
+            # ----------------------------------------------------
+            # IMPORTANT
+            #
+            # Small gaps remain inside ONE band.
+            # This avoids creating dozens of show_pdf_page()
+            # objects for one paragraph/page.
+            # ----------------------------------------------------
+
+            if gap <= self.BAND_MERGE_GAP:
 
                 previous[1] = max(
                     previous[1],
@@ -281,127 +280,31 @@ class SpaceEngine:
             else:
 
                 merged.append(
-                    [
-                        y0,
-                        y1,
-                    ]
+                    [y0, y1]
                 )
 
-        return [
-            SpaceBand(
-                source_page=page_number,
-                y0=y0,
-                y1=y1,
-            )
-            for y0, y1 in merged
-        ]
+        # --------------------------------------------------------
+        # Now remove only genuinely unnecessary large spaces.
+        #
+        # A large gap is retained as a boundary between bands.
+        # --------------------------------------------------------
 
-    # ============================================================
-    # TITLE DETECTION
-    # ============================================================
+        bands: list[SpaceBand] = []
 
-    def _titles_on_page(
-        self,
-        blocks: list[TextBlock],
-        page_number: int,
-    ) -> list[TextBlock]:
-        """
-        Return probable title blocks for one page.
+        for y0, y1 in merged:
 
-        No title names are hard-coded.
-
-        Titles are detected from their typography.
-        """
-
-        page_blocks = [
-            block
-            for block in blocks
-            if block.page == page_number
-            and block.is_text
-            and not block.is_empty
-        ]
-
-        if not page_blocks:
-            return []
-
-        # We need font information. TextBlock versions without
-        # typography information simply cannot participate here.
-        result: list[TextBlock] = []
-
-        for block in page_blocks:
-
-            font_size = getattr(
-                block,
-                "font_size",
-                0.0,
-            )
-
-            if font_size < self.SUBTITLE_SIZE:
+            if y1 <= y0:
                 continue
 
-            text = block.text.strip()
-
-            if not text:
-                continue
-
-            result.append(block)
-
-        return result
-
-    def _title_requires_new_page(
-        self,
-        title: TextBlock,
-        blocks: list[TextBlock],
-    ) -> bool:
-        """
-        Decide whether a title must start a new page.
-
-        Major titles:
-            always start a new page.
-
-        Smaller section titles:
-            start a new page only when fewer than five lines
-            of content follow them.
-        """
-
-        size = getattr(
-            title,
-            "font_size",
-            0.0,
-        )
-
-        # Major chapter / section.
-        if size >= self.MAJOR_TITLE_SIZE:
-            return True
-
-        # Smaller subsection.
-        following = [
-            block
-            for block in blocks
-            if block.page == title.page
-            and block.is_text
-            and block.y0 > title.y1
-            and not block.is_empty
-        ]
-
-        lines_after = 0
-
-        for block in following:
-
-            text = block.text.strip()
-
-            if not text:
-                continue
-
-            lines_after += max(
-                1,
-                text.count("\n") + 1,
+            bands.append(
+                SpaceBand(
+                    source_page=page_number,
+                    y0=y0,
+                    y1=y1,
+                )
             )
 
-            if lines_after >= self.MIN_LINES_AFTER_SUBTITLE:
-                break
-
-        return lines_after < self.MIN_LINES_AFTER_SUBTITLE
+        return bands
 
     # ============================================================
     # OUTPUT FLOW
@@ -411,17 +314,13 @@ class SpaceEngine:
         self,
         document: fitz.Document,
         pages: list[list[SpaceBand]],
-        blocks: list[TextBlock],
+        titles,
     ) -> list[list[OutputBand]]:
         """
-        Build the compacted output.
+        Move bands into a compact output flow.
 
-        IMPORTANT:
-
-        A source page is consumed once.
-
-        We never append several independent copies of the same
-        source page to the output flow.
+        Titles representing major sections are forced onto a
+        new page when required by TitleDetector.
         """
 
         if document.page_count == 0:
@@ -430,72 +329,78 @@ class SpaceEngine:
         page_width = document[0].rect.width
         page_height = document[0].rect.height
 
-        usable_bottom = (
-            page_height
-            - self.BOTTOM_MARGIN
-        )
-
         output_pages: list[list[OutputBand]] = []
 
         current_page: list[OutputBand] = []
 
         cursor = self.TOP_MARGIN
 
-        for source_page, source_bands in enumerate(pages):
+        for source_page, bands in enumerate(pages):
 
-            if not source_bands:
+            if not bands:
                 continue
 
-            # ----------------------------------------------------
-            # Detect major titles on this source page.
-            # ----------------------------------------------------
-
-            titles = self._titles_on_page(
-                blocks,
-                source_page,
-            )
-
-            force_page = any(
-                self._title_requires_new_page(
-                    title,
-                    blocks,
-                )
+            page_titles = [
+                title
                 for title in titles
-            )
+                if title.page == source_page
+            ]
 
-            # A title beginning the page does not need an
-            # additional empty page.
-            if force_page and current_page:
+            for band_index, band in enumerate(bands):
 
-                self._flush_current_page(
-                    current_page,
-                    output_pages,
-                )
+                band_height = band.height
 
-                current_page = []
-
-                cursor = self.TOP_MARGIN
-
-            # ----------------------------------------------------
-            # Process the complete source page once.
-            # ----------------------------------------------------
-
-            for band in source_bands:
-
-                if band.height <= 0:
+                if band_height <= 0:
                     continue
 
-                # Do not create a second copy of the source page.
+                # ------------------------------------------------
+                # Determine whether a title occurs in this band.
+                # ------------------------------------------------
+
+                band_titles = [
+                    title
+                    for title in page_titles
+                    if self._title_is_in_band(
+                        title,
+                        band,
+                    )
+                ]
+
+                force_new_page = any(
+                    self._title_requires_new_page(title)
+                    for title in band_titles
+                )
+
+                # ------------------------------------------------
+                # Major title -> new page.
+                #
+                # We don't do this for every subsection.
+                # ------------------------------------------------
+
                 if (
-                    cursor + band.height
-                    > usable_bottom
+                    force_new_page
+                    and current_page
+                ):
+                    output_pages.append(
+                        current_page
+                    )
+
+                    current_page = []
+
+                    cursor = self.TOP_MARGIN
+
+                # ------------------------------------------------
+                # Normal overflow.
+                # ------------------------------------------------
+
+                if (
+                    cursor + band_height
+                    > page_height - self.BOTTOM_MARGIN
                 ):
 
                     if current_page:
-
-                        self._flush_current_page(
-                            current_page,
-                            output_pages,
+                        output_pages.append(
+                            current_page
                         )
 
                     current_page = []
@@ -505,8 +410,8 @@ class SpaceEngine:
                 target_y0 = cursor
 
                 target_y1 = (
-                    target_y0
-                    + band.height
+                    cursor
+                    + band_height
                 )
 
                 current_page.append(
@@ -519,11 +424,13 @@ class SpaceEngine:
                     )
                 )
 
-                if abs(
-                    band.y0
-                    - target_y0
-                ) > 1.0:
-
+                if (
+                    abs(
+                        band.y0
+                        - target_y0
+                    )
+                    > 1.0
+                ):
                     self._blocks_moved += 1
 
                 cursor = (
@@ -532,36 +439,61 @@ class SpaceEngine:
                 )
 
         if current_page:
-
-            self._flush_current_page(
-                current_page,
-                output_pages,
+            output_pages.append(
+                current_page
             )
 
         return output_pages
 
-    def _flush_current_page(
+    # ============================================================
+    # TITLE HELPERS
+    # ============================================================
+
+    def _title_is_in_band(
         self,
-        current_page: list[OutputBand],
-        output_pages: list[list[OutputBand]],
-    ) -> None:
+        title,
+        band: SpaceBand,
+    ) -> bool:
         """
-        Add one output page to the result.
-
-        A page is added exactly once.
+        Determine whether a title belongs to a source band.
         """
 
-        if not current_page:
-            return
+        try:
+            title_y0 = title.block.y0
+            title_y1 = title.block.y1
+        except AttributeError:
+            return False
 
-        output_pages.append(
-            list(current_page)
+        return (
+            title_y1 >= band.y0
+            and title_y0 <= band.y1
         )
+
+    def _title_requires_new_page(
+        self,
+        title,
+    ) -> bool:
+        """
+        Decide whether a detected title starts a new major section.
+
+        Rules used for the current ENI document:
+
+        - level 1 => new page
+        - level 2 => normally stays on the current page
+        - short subsection headings do not force a new page
+        """
+
+        try:
+            level = title.level
+        except AttributeError:
+            return False
+
+        return level == 1
 
     # ============================================================
     # OUTPUT
     # ============================================================
-
+   
     def _write_output(
         self,
         source: fitz.Document,
@@ -571,7 +503,11 @@ class SpaceEngine:
         """
         Write the compacted PDF.
 
-        Each output band is copied exactly once.
+        Each source band is rendered independently before being inserted
+        into the output document.
+
+        This avoids duplicated hidden PDF objects caused by repeated
+        show_pdf_page(..., clip=...).
         """
 
         output = fitz.open()
@@ -591,6 +527,14 @@ class SpaceEngine:
                         band.source_page
                     ]
 
+                    band_height = (
+                        band.source_y1
+                        - band.source_y0
+                    )
+
+                    if band_height <= 0:
+                        continue
+
                     source_rect = fitz.Rect(
                         0,
                         band.source_y0,
@@ -605,14 +549,47 @@ class SpaceEngine:
                         band.target_y1,
                     )
 
-                    target_page.show_pdf_page(
-                        target_rect,
-                        source,
-                        band.source_page,
+                    # ------------------------------------------------
+                    # Render only the actual source band.
+                    #
+                    # A higher resolution is used to preserve the
+                    # visual quality of text, images and diagrams.
+                    # ------------------------------------------------
+
+                    matrix = fitz.Matrix(
+                        2.0,
+                        2.0,
+                    )
+
+                    pixmap = source_page.get_pixmap(
+                        matrix=matrix,
                         clip=source_rect,
+                        alpha=False,
+                    )
+
+                    image_bytes = pixmap.tobytes(
+                        "png"
+                    )
+
+                    # ------------------------------------------------
+                    # Insert exactly one visible object.
+                    # ------------------------------------------------
+
+                    target_page.insert_image(
+                        target_rect,
+                        stream=image_bytes,
                         keep_proportion=False,
                         overlay=True,
                     )
+
+                    if (
+                        abs(
+                            band.source_y0
+                            - band.target_y0
+                        )
+                        > 1.0
+                    ):
+                        self._blocks_moved += 1
 
             self._pages_created = len(output)
 
@@ -620,8 +597,8 @@ class SpaceEngine:
                 output_path,
                 garbage=4,
                 deflate=True,
+                clean=True,
             )
 
         finally:
-
             output.close()
