@@ -23,9 +23,6 @@ from pdfclean.detector.title import TitleDetector
 class TextItem:
     """
     Native text item extracted from a PDF.
-
-    Text is stored with its visual information so it can be
-    reinserted as real PDF text.
     """
 
     source_page: int
@@ -40,6 +37,28 @@ class TextItem:
     font: str
     size: float
     color: tuple[float, float, float]
+
+    bold: bool = False
+    italic: bool = False
+
+@dataclass(slots=True)
+class TextLine:
+    """
+    Native PDF text line.
+
+    A line contains several spans that must keep their original
+    horizontal relationships.
+    """
+
+    source_page: int
+
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    spans: list[TextItem]
+
 
 
 @dataclass(slots=True)
@@ -125,6 +144,11 @@ class SpaceEngine:
         self._pages_created = 0
         self._blocks_moved = 0
 
+        self._font_cache: dict[
+            str,
+            tuple[str, bytes],
+        ] = {}
+
     @property
     def pages_created(self) -> int:
         return self._pages_created
@@ -183,12 +207,14 @@ class SpaceEngine:
             usable_blocks,
         )
 
-        text_items = self._extract_text_items(
+        text_lines = self._extract_text_lines(
             source,
             headers,
             footers,
             page_numbers,
         )
+
+
 
         output_bands = self._build_output_flow(
             source,
@@ -199,7 +225,7 @@ class SpaceEngine:
         self._write_output(
             source,
             output_bands,
-            text_items,
+            text_lines,
             output_path,
         )
 
@@ -492,19 +518,18 @@ class SpaceEngine:
     # TEXT EXTRACTION
     # ============================================================
 
-    def _extract_text_items(
+    def _extract_text_lines(
         self,
         document: fitz.Document,
         headers,
         footers,
         page_numbers,
-    ) -> list[TextItem]:
+    ) -> list[TextLine]:
         """
-        Extract native text spans while excluding headers,
-        footers and page numbers.
+        Extract native PDF lines while preserving span positions.
         """
 
-        items: list[TextItem] = []
+        lines: list[TextLine] = []
 
         for page_number, page in enumerate(document):
 
@@ -517,11 +542,15 @@ class SpaceEngine:
 
                 for line in block.get("lines", []):
 
+                    line_spans: list[TextItem] = []
+
                     for span in line.get("spans", []):
 
-                        text = span.get(
-                            "text",
-                            "",
+                        text = str(
+                            span.get(
+                                "text",
+                                "",
+                            )
                         )
 
                         if not text:
@@ -532,11 +561,13 @@ class SpaceEngine:
                         if not bbox:
                             continue
 
-                        x0, y0, x1, y1 = bbox
+                        x0, y0, x1, y1 = map(
+                            float,
+                            bbox,
+                        )
 
-                        # ------------------------------------------------
-                        # Ignore headers / footers / page numbers.
-                        # ------------------------------------------------
+                        if x1 <= x0 or y1 <= y0:
+                            continue
 
                         span_rect = fitz.Rect(
                             x0,
@@ -561,11 +592,29 @@ class SpaceEngine:
                             )
                         )
 
+                        if size <= 0:
+                            size = 10.0
+
                         font = str(
                             span.get(
                                 "font",
                                 "helv",
                             )
+                        )
+
+                        flags = int(
+                            span.get(
+                                "flags",
+                                0,
+                            )
+                        )
+
+                        bold = bool(
+                            flags & 16
+                        )
+
+                        italic = bool(
+                            flags & 2
                         )
 
                         color = self._pdf_color_to_rgb(
@@ -575,21 +624,51 @@ class SpaceEngine:
                             )
                         )
 
-                        items.append(
+                        line_spans.append(
                             TextItem(
                                 source_page=page_number,
-                                x0=float(x0),
-                                y0=float(y0),
-                                x1=float(x1),
-                                y1=float(y1),
+                                x0=x0,
+                                y0=y0,
+                                x1=x1,
+                                y1=y1,
                                 text=text,
                                 font=font,
                                 size=size,
                                 color=color,
+                                bold=bold,
+                                italic=italic,
                             )
                         )
 
-        return items
+                    if not line_spans:
+                        continue
+
+                    lines.append(
+                        TextLine(
+                            source_page=page_number,
+                            x0=min(
+                                span.x0
+                                for span in line_spans
+                            ),
+                            y0=min(
+                                span.y0
+                                for span in line_spans
+                            ),
+                            x1=max(
+                                span.x1
+                                for span in line_spans
+                            ),
+                            y1=max(
+                                span.y1
+                                for span in line_spans
+                            ),
+                            spans=line_spans,
+                        )
+                    )
+
+        return lines
+
+
 
     def _rect_in_excluded_region(
         self,
@@ -676,35 +755,252 @@ class SpaceEngine:
     # OUTPUT
     # ============================================================
 
+    def _get_output_font(
+        self,
+        source: fitz.Document,
+        source_page_number: int,
+        source_font_name: str,
+        target_page: fitz.Page,
+    ) -> str:
+        """
+        Extract the real embedded font from the source PDF and install
+        it once on the target page.
+
+        Returns the font name to use with insert_text().
+        """
+
+        cache_key = (
+            source_font_name,
+        )
+
+        # --------------------------------------------------------
+        # Already installed for this source font.
+        # --------------------------------------------------------
+
+        cached = self._font_cache.get(
+            cache_key
+        )
+
+        if cached is not None:
+
+            output_font_name, _ = cached
+
+            return output_font_name
+
+        source_page = source[
+            source_page_number
+        ]
+
+        # --------------------------------------------------------
+        # Find the PDF font resource corresponding to the span.
+        # --------------------------------------------------------
+
+        source_fonts = source_page.get_fonts(
+            full=True
+        )
+
+        matched_xref: int | None = None
+
+        for font_info in source_fonts:
+
+            if len(font_info) < 4:
+                continue
+
+            xref = int(
+                font_info[0]
+            )
+
+            basefont = str(
+                font_info[3]
+            )
+
+            # PyMuPDF may expose prefixes such as:
+            # ABCDEF+Roboto-Regular
+            #
+            # Compare both the complete name and the suffix.
+            if (
+                basefont == source_font_name
+                or basefont.endswith(
+                    "+" + source_font_name
+                )
+            ):
+                matched_xref = xref
+                break
+
+        if matched_xref is None:
+            # Some PDFs use a slightly different name in the font
+            # resource than in the text span. Try a normalized match.
+            wanted = (
+                source_font_name
+                .replace(
+                    "-Identity-H",
+                    "",
+                )
+                .lower()
+            )
+
+            for font_info in source_fonts:
+
+                if len(font_info) < 4:
+                    continue
+
+                xref = int(
+                    font_info[0]
+                )
+
+                basefont = str(
+                    font_info[3]
+                )
+
+                normalized = (
+                    basefont
+                    .replace(
+                        "-Identity-H",
+                        "",
+                    )
+                    .lower()
+                )
+
+                if (
+                    wanted in normalized
+                    or normalized in wanted
+                ):
+                    matched_xref = xref
+                    break
+
+        # --------------------------------------------------------
+        # No matching embedded font.
+        # --------------------------------------------------------
+
+        if matched_xref is None:
+            return self._safe_font(
+                source_font_name,
+                False,
+                False,
+            )
+
+        # --------------------------------------------------------
+        # Extract the actual font bytes.
+        # --------------------------------------------------------
+
+        try:
+
+            font_info = source.extract_font(
+                matched_xref
+            )
+
+            if not font_info:
+                raise ValueError(
+                    "Empty extracted font."
+                )
+
+            # PyMuPDF returns:
+            #
+            # (xref, ext, type, name, content)
+            #
+            # The fifth element is the actual font data.
+            font_buffer = font_info[4]
+
+            if not font_buffer:
+                raise ValueError(
+                    "Font has no embedded data."
+                )
+
+        except Exception:
+            return self._safe_font(
+                source_font_name,
+                False,
+                False,
+            )
+
+        # --------------------------------------------------------
+        # Create a unique output font name.
+        # --------------------------------------------------------
+
+        safe_name = (
+            source_font_name
+            .replace(
+                "-",
+                "_",
+            )
+            .replace(
+                "+",
+                "_",
+            )
+            .replace(
+                " ",
+                "_",
+            )
+            .replace(
+                "/",
+                "_",
+            )
+            .replace(
+                "\\",
+                "_",
+            )
+        )
+
+        output_font_name = (
+            f"PDFC_{source_page_number}_"
+            f"{safe_name}"
+        )
+
+        # Avoid names that are too long or contain problematic chars.
+        output_font_name = (
+            output_font_name[:60]
+        )
+
+        # --------------------------------------------------------
+        # Install the real font in the output page.
+        # --------------------------------------------------------
+
+        try:
+
+            target_page.insert_font(
+                fontname=output_font_name,
+                fontbuffer=font_buffer,
+                set_simple=False,
+            )
+
+        except Exception:
+
+            return self._safe_font(
+                source_font_name,
+                False,
+                False,
+            )
+
+        self._font_cache[
+            cache_key
+        ] = (
+            output_font_name,
+            font_buffer,
+        )
+
+        return output_font_name
+
+
+
     def _write_output(
         self,
         source: fitz.Document,
         pages: list[list[OutputBand]],
-        text_items: list[TextItem],
+        text_lines: list[TextLine],
         output_path: str | Path,
     ) -> None:
         """
         Create the output PDF.
 
-        Text is inserted as actual PDF text.
-        No PNG conversion is performed.
+        Text is inserted as native PDF text.
+
+        Each source line is inserted once while keeping the
+        original horizontal span positions.
         """
 
         output = fitz.open()
 
         try:
-
-            items_by_page: dict[
-                int,
-                list[TextItem],
-            ] = {}
-
-            for item in text_items:
-
-                items_by_page.setdefault(
-                    item.source_page,
-                    [],
-                ).append(item)
 
             for page_bands in pages:
 
@@ -715,75 +1011,87 @@ class SpaceEngine:
 
                 for band in page_bands:
 
-                    items = items_by_page.get(
-                        band.source_page,
-                        [],
+                    # ------------------------------------------------
+                    # Vertical translation applied to this band.
+                    # ------------------------------------------------
+
+                    y_offset = (
+                        band.target_y0
+                        - band.source_y0
                     )
 
-                    for item in items:
+                    # ------------------------------------------------
+                    # Process only lines belonging to this source page.
+                    # ------------------------------------------------
 
-                        # Item must belong to the current band.
+                    for line in text_lines:
+
+                        if line.source_page != band.source_page:
+                            continue
+
+                        # ------------------------------------------------
+                        # The line must belong to this band.
+                        # ------------------------------------------------
+
                         if (
-                            item.y1 < band.source_y0
-                            or item.y0 > band.source_y1
+                            line.y1 < band.source_y0
+                            or line.y0 > band.source_y1
                         ):
                             continue
 
                         # ------------------------------------------------
-                        # Calculate vertical translation.
+                        # Preserve the original baseline relationship.
                         # ------------------------------------------------
 
-                        y_offset = (
-                            band.target_y0
-                            - band.source_y0
-                        )
-
-                        target_x = item.x0
-
-                        target_y = (
-                            item.y0
+                        target_baseline = (
+                            line.y1
                             + y_offset
                         )
 
                         # ------------------------------------------------
-                        # Try to reuse the original font.
-                        #
-                        # Standard fonts work directly. Embedded fonts may
-                        # not always be reusable under their PDF name.
+                        # Reinsert every span at its original X position.
                         # ------------------------------------------------
 
-                        fontname = self._safe_font(
-                            item.font
-                        )
+                        for span in line.spans:
 
-                        try:
-
-                            target_page.insert_text(
-                                (
-                                    target_x,
-                                    target_y + item.size,
-                                ),
-                                item.text,
-                                fontsize=item.size,
-                                fontname=fontname,
-                                color=item.color,
-                                overlay=True,
+                            fontname = self._get_output_font(
+                                source,
+                                band.source_page,
+                                span.font,
+                                target_page,
                             )
 
-                        except Exception:
+                            try:
 
-                            # Safe fallback keeps the text editable.
-                            target_page.insert_text(
-                                (
-                                    target_x,
-                                    target_y + item.size,
-                                ),
-                                item.text,
-                                fontsize=item.size,
-                                fontname="helv",
-                                color=item.color,
-                                overlay=True,
-                            )
+                                target_page.insert_text(
+                                    (
+                                        span.x0,
+                                        target_baseline,
+                                    ),
+                                    span.text,
+                                    fontsize=span.size,
+                                    fontname=fontname,
+                                    color=span.color,
+                                    overlay=True,
+                                )
+
+                            except Exception:
+
+                                # ------------------------------------------------
+                                # Fallback font. Text remains native/editable.
+                                # ------------------------------------------------
+
+                                target_page.insert_text(
+                                    (
+                                        span.x0,
+                                        target_baseline,
+                                    ),
+                                    span.text,
+                                    fontsize=span.size,
+                                    fontname="helv",
+                                    color=span.color,
+                                    overlay=True,
+                                )
 
             self._pages_created = len(output)
 
@@ -797,39 +1105,87 @@ class SpaceEngine:
         finally:
             output.close()
 
+
     def _safe_font(
         self,
         font: str,
+        bold: bool = False,
+        italic: bool = False,
     ) -> str:
         """
-        Map common PDF font names to built-in PyMuPDF fonts.
+        Select a built-in PDF font matching the detected style.
 
-        Unknown embedded fonts fall back to Helvetica.
+        The original PDF may use embedded fonts such as Roboto.
+        In that case we use the closest built-in PDF font while
+        preserving bold and italic when possible.
         """
 
         name = font.lower()
 
-        if "times" in name:
-            return "tiro"
+        # ------------------------------------------------------------
+        # Courier / monospace
+        # ------------------------------------------------------------
 
         if (
             "courier" in name
             or "mono" in name
+            or "consolas" in name
         ):
+            if bold and italic:
+                return "cobo"
+
+            if bold:
+                return "cobo"
+
+            if italic:
+                return "coit"
+
             return "cour"
 
+        # ------------------------------------------------------------
+        # Times / serif
+        # ------------------------------------------------------------
+
         if (
-            "helvetica" in name
-            or "arial" in name
+            "times" in name
+            or "serif" in name
+            or "georgia" in name
         ):
-            return "helv"
+            if bold and italic:
+                return "tibi"
+
+            if bold:
+                return "tibo"
+
+            if italic:
+                return "tiit"
+
+            return "tiro"
+
+        # ------------------------------------------------------------
+        # Symbol
+        # ------------------------------------------------------------
 
         if "symbol" in name:
             return "symb"
 
-        # Roboto and other embedded PDF fonts cannot reliably
-        # be referenced only by their PDF font name.
+        # ------------------------------------------------------------
+        # Sans serif
+        #
+        # Roboto, Arial, Calibri, Helvetica, etc.
+        # ------------------------------------------------------------
+
+        if bold and italic:
+            return "hebi"
+
+        if bold:
+            return "hebo"
+
+        if italic:
+            return "heit"
+
         return "helv"
+
 
     def _is_in_excluded_region(
         self,
