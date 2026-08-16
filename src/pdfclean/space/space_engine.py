@@ -6,7 +6,7 @@ as native PDF text.
 """
 
 from __future__ import annotations
-
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -691,42 +691,167 @@ class SpaceEngine:
                             index
                         ]
 
+                        # ------------------------------------------------
+                        # Determine whether a real word space exists.
+                        #
+                        # We only infer a missing space when the characters
+                        # around the gap are compatible with a word boundary.
+                        # ------------------------------------------------
+
+                        previous_text = previous.text.rstrip()
+                        current_text = current.text.lstrip()
+
+                        if not previous_text or not current_text:
+                            continue
+
+                        previous_last = previous_text[-1]
+                        current_first = current_text[0]
+
+                        # ------------------------------------------------
+                        # Characters that cannot have a preceding space.
+                        # ------------------------------------------------
+
+                        NO_SPACE_BEFORE = {
+                            ".",
+                            ",",
+                            ";",
+                            ":",
+                            "!",
+                            "?",
+                            "%",
+                            ")",
+                            "]",
+                            "}",
+                            "»",
+                        }
+
+                        # ------------------------------------------------
+                        # Characters that cannot have a following space.
+                        # ------------------------------------------------
+
+                        NO_SPACE_AFTER = {
+                            "(",
+                            "[",
+                            "{",
+                            "«",
+                        }
+
+                        # ------------------------------------------------
+                        # Apostrophe:
+                        #
+                        # "l'analyseur"
+                        # "d'administration"
+                        #
+                        # must NEVER become:
+                        #
+                        # "l' analyseur"
+                        # ------------------------------------------------
+
+                        APOSTROPHES = {
+                            "'",
+                            "’",
+                            "ʼ",
+                            "′",
+                        }
+
+                        # ------------------------------------------------
+                        # First respect explicit spaces present in the
+                        # original extracted text.
+                        # ------------------------------------------------
+
+                        explicit_space = (
+                            previous.text.endswith(" ")
+                            or current.text.startswith(" ")
+                        )
+
+                        # ------------------------------------------------
+                        # Never insert spaces around punctuation or
+                        # apostrophes.
+                        # ------------------------------------------------
+
+                        punctuation_case = (
+                            current_first in NO_SPACE_BEFORE
+                            or previous_last in NO_SPACE_AFTER
+                            or previous_last in APOSTROPHES
+                            or current_first in APOSTROPHES
+                        )
+
+                        if punctuation_case:
+                            current.has_space_before = explicit_space
+                            continue
+
+                        # ------------------------------------------------
+                        # Infer a missing word space geometrically.
+                        #
+                        # Only do this when both sides look like normal
+                        # word characters.
+                        # ------------------------------------------------
+
+                        previous_is_word = (
+                            previous_last.isalnum()
+                            or previous_last in {
+                                "à",
+                                "â",
+                                "ä",
+                                "ç",
+                                "é",
+                                "è",
+                                "ê",
+                                "ë",
+                                "î",
+                                "ï",
+                                "ô",
+                                "ö",
+                                "ù",
+                                "û",
+                                "ü",
+                                "ÿ",
+                            }
+                        )
+
+                        current_is_word = (
+                            current_first.isalnum()
+                            or current_first in {
+                                "à",
+                                "â",
+                                "ä",
+                                "ç",
+                                "é",
+                                "è",
+                                "ê",
+                                "ë",
+                                "î",
+                                "ï",
+                                "ô",
+                                "ö",
+                                "ù",
+                                "û",
+                                "ü",
+                                "ÿ",
+                            }
+                        )
+
                         geometric_gap = (
                             current.x0
                             - previous.x1
                         )
 
-                        text_gap = (
-                            previous.text.endswith(
-                                " "
-                            )
-                            or current.text.startswith(
-                                " "
-                            )
-                        )
-
-                        # ------------------------------------------------
-                        # PDF text extraction often separates words into
-                        # spans even when the actual space character is
-                        # not stored in either span.
-                        #
-                        # A gap around 1/4 of the font size or more is a
-                        # useful conservative indicator of a word space.
-                        # ------------------------------------------------
-
                         geometric_space = (
-                            geometric_gap
+                            previous_is_word
+                            and current_is_word
+                            and geometric_gap
                             >= max(
-                                0.8,
-                                current.size * 0.20,
+                                1.0,
+                                current.size * 0.30,
                             )
                         )
 
                         if (
-                            text_gap
+                            explicit_space
                             or geometric_space
                         ):
                             current.has_space_before = True
+
 
                     lines.append(
                         TextLine(
@@ -1073,7 +1198,74 @@ class SpaceEngine:
 
         return output_font_name
 
+    def _normalize_pdf_text(
+        self,
+        text: str,
+    ) -> str:
+        """
+        Normalize PDF text characters and remove
+        incorrect spaces around punctuation.
+        """
 
+        # --------------------------------------------------------
+        # Normalize apostrophe-like characters.
+        # --------------------------------------------------------
+
+        replacements = {
+            "\u2018": "'",   # ‘
+            "\u2019": "'",   # ’
+            "\u201B": "'",   # ‛
+            "\u2032": "'",   # ′
+            "\u00B4": "'",   # ´
+            "\u0060": "'",   # `
+        }
+
+        for source, target in replacements.items():
+            text = text.replace(
+                source,
+                target,
+            )
+
+        # --------------------------------------------------------
+        # Remove spaces after apostrophes.
+        #
+        # l' analyseur -> l'analyseur
+        # d' administration -> d'administration
+        # --------------------------------------------------------
+
+        text = re.sub(
+            r"'\s+",
+            "'",
+            text,
+        )
+
+        # --------------------------------------------------------
+        # Remove spaces before punctuation.
+        #
+        # performances , -> performances,
+        # données .      -> données.
+        # --------------------------------------------------------
+
+        text = re.sub(
+            r"\s+([,.;:!?%\)\]\}])",
+            r"\1",
+            text,
+        )
+
+        # --------------------------------------------------------
+        # Remove spaces after opening punctuation.
+        #
+        # ( texte -> (texte
+        # [ texte -> [texte
+        # --------------------------------------------------------
+
+        text = re.sub(
+            r"([\(\[\{«])\s+",
+            r"\1",
+            text,
+        )
+
+        return text
 
     def _write_output(
         self,
@@ -1319,30 +1511,59 @@ class SpaceEngine:
             footers,
             page_numbers,
         )
-    def _normalize_pdf_text(
-        self,
-        text: str,
-    ) -> str:
-        """
-        Normalize characters that can be incorrectly encoded when
-        native PDF text is reinserted.
 
-        The text remains editable/selectable.
-        """
+def _normalize_pdf_text(
+    self,
+    text: str,
+) -> str:
+    """
+    Normalize PDF text characters and remove
+    incorrect spaces around punctuation.
+    """
 
-        replacements = {
-            "\u2018": "'",   # ‘
-            "\u2019": "'",   # ’
-            "\u201B": "'",   # ‛
-            "\u2032": "'",   # ′
-            "\u00B4": "'",   # ´
-            "\u0060": "'",   # `
-        }
+    replacements = {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201B": "'",
+        "\u2032": "'",
+        "\u00B4": "'",
+        "\u0060": "'",
+    }
 
-        for source, target in replacements.items():
-            text = text.replace(
-                source,
-                target,
-            )
+    for source, target in replacements.items():
+        text = text.replace(
+            source,
+            target,
+        )
 
-        return text
+    # ------------------------------------------------
+    # Never leave a space after an apostrophe.
+    # ------------------------------------------------
+
+    text = re.sub(
+        r"(['’])\s+",
+        r"\1",
+        text,
+    )
+
+    # ------------------------------------------------
+    # Never leave a space before punctuation.
+    # ------------------------------------------------
+
+    text = re.sub(
+        r"\s+([,.;:!?%\)\]\}])",
+        r"\1",
+        text,
+    )
+
+    # ------------------------------------------------
+    # No space immediately after opening punctuation.
+    # ------------------------------------------------
+
+    text = re.sub(
+        r"([\(\[\{«])\s+",
+        r"\1",
+        text,
+    )
+
+    return text
