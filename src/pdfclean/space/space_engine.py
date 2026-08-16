@@ -22,7 +22,7 @@ from pdfclean.detector.title import TitleDetector
 @dataclass(slots=True)
 class TextItem:
     """
-    Native text item extracted from a PDF.
+    Native PDF text item extracted from a PDF.
     """
 
     source_page: int
@@ -41,13 +41,15 @@ class TextItem:
     bold: bool = False
     italic: bool = False
 
+    has_space_before: bool = False
+
+
 @dataclass(slots=True)
 class TextLine:
     """
     Native PDF text line.
 
-    A line contains several spans that must keep their original
-    horizontal relationships.
+    Spans keep their original horizontal positions.
     """
 
     source_page: int
@@ -58,6 +60,9 @@ class TextLine:
     y1: float
 
     spans: list[TextItem]
+
+    # Espaces horizontaux entre les spans successifs.
+    gaps: list[float]
 
 
 
@@ -526,7 +531,17 @@ class SpaceEngine:
         page_numbers,
     ) -> list[TextLine]:
         """
-        Extract native PDF lines while preserving span positions.
+        Extract native PDF lines while preserving the original
+        horizontal geometry.
+
+        We explicitly detect spaces between spans so that the
+        reconstructed text does not merge words such as:
+
+            optimisationdu
+
+        or:
+
+            Profileret
         """
 
         lines: list[TextLine] = []
@@ -643,6 +658,76 @@ class SpaceEngine:
                     if not line_spans:
                         continue
 
+                    # ------------------------------------------------
+                    # Always process spans from left to right.
+                    # ------------------------------------------------
+
+                    line_spans.sort(
+                        key=lambda span: (
+                            span.x0,
+                            span.y0,
+                        )
+                    )
+
+                    # ------------------------------------------------
+                    # Determine whether a span needs an explicit
+                    # space before it.
+                    #
+                    # We use both:
+                    #   1. the original text
+                    #   2. the geometric gap between spans
+                    # ------------------------------------------------
+
+                    for index in range(
+                        1,
+                        len(line_spans),
+                    ):
+
+                        previous = line_spans[
+                            index - 1
+                        ]
+
+                        current = line_spans[
+                            index
+                        ]
+
+                        geometric_gap = (
+                            current.x0
+                            - previous.x1
+                        )
+
+                        text_gap = (
+                            previous.text.endswith(
+                                " "
+                            )
+                            or current.text.startswith(
+                                " "
+                            )
+                        )
+
+                        # ------------------------------------------------
+                        # PDF text extraction often separates words into
+                        # spans even when the actual space character is
+                        # not stored in either span.
+                        #
+                        # A gap around 1/4 of the font size or more is a
+                        # useful conservative indicator of a word space.
+                        # ------------------------------------------------
+
+                        geometric_space = (
+                            geometric_gap
+                            >= max(
+                                0.8,
+                                current.size * 0.20,
+                            )
+                        )
+
+                        if (
+                            text_gap
+                            or geometric_space
+                        ):
+                            current.has_space_before = True
+
                     lines.append(
                         TextLine(
                             source_page=page_number,
@@ -663,12 +748,20 @@ class SpaceEngine:
                                 for span in line_spans
                             ),
                             spans=line_spans,
+                            gaps=[
+                                max(
+                                    0.0,
+                                    line_spans[i + 1].x0
+                                    - line_spans[i].x1,
+                                )
+                                for i in range(
+                                    len(line_spans) - 1
+                                )
+                            ],
                         )
                     )
 
         return lines
-
-
 
     def _rect_in_excluded_region(
         self,
@@ -1029,36 +1122,48 @@ class SpaceEngine:
                         if line.source_page != band.source_page:
                             continue
 
-                        # ------------------------------------------------
-                        # The line must belong to this band.
-                        # ------------------------------------------------
-
                         if (
                             line.y1 < band.source_y0
                             or line.y0 > band.source_y1
                         ):
                             continue
 
-                        # ------------------------------------------------
-                        # Preserve the original baseline relationship.
-                        # ------------------------------------------------
+                        y_offset = (
+                            band.target_y0
+                            - band.source_y0
+                        )
 
                         target_baseline = (
                             line.y1
                             + y_offset
                         )
 
-                        # ------------------------------------------------
-                        # Reinsert every span at its original X position.
-                        # ------------------------------------------------
+                        for index, span in enumerate(
+                            line.spans
+                        ):
 
-                        for span in line.spans:
+                            text = span.text
+
+                            # --------------------------------------------------------
+                            # Preserve an explicit word separator.
+                            # --------------------------------------------------------
+
+                            if (
+                                index > 0
+                                and span.has_space_before
+                                and not text.startswith(" ")
+                            ):
+                                text = " " + text
 
                             fontname = self._get_output_font(
                                 source,
                                 band.source_page,
                                 span.font,
                                 target_page,
+                            )
+
+                            text = self._normalize_pdf_text(
+                                text
                             )
 
                             try:
@@ -1068,7 +1173,7 @@ class SpaceEngine:
                                         span.x0,
                                         target_baseline,
                                     ),
-                                    span.text,
+                                    text,
                                     fontsize=span.size,
                                     fontname=fontname,
                                     color=span.color,
@@ -1077,21 +1182,22 @@ class SpaceEngine:
 
                             except Exception:
 
-                                # ------------------------------------------------
-                                # Fallback font. Text remains native/editable.
-                                # ------------------------------------------------
-
                                 target_page.insert_text(
                                     (
                                         span.x0,
                                         target_baseline,
                                     ),
-                                    span.text,
+                                    text,
                                     fontsize=span.size,
-                                    fontname="helv",
+                                    fontname=self._safe_font(
+                                        span.font,
+                                        span.bold,
+                                        span.italic,
+                                    ),
                                     color=span.color,
                                     overlay=True,
                                 )
+
 
             self._pages_created = len(output)
 
@@ -1213,3 +1319,30 @@ class SpaceEngine:
             footers,
             page_numbers,
         )
+    def _normalize_pdf_text(
+        self,
+        text: str,
+    ) -> str:
+        """
+        Normalize characters that can be incorrectly encoded when
+        native PDF text is reinserted.
+
+        The text remains editable/selectable.
+        """
+
+        replacements = {
+            "\u2018": "'",   # ‘
+            "\u2019": "'",   # ’
+            "\u201B": "'",   # ‛
+            "\u2032": "'",   # ′
+            "\u00B4": "'",   # ´
+            "\u0060": "'",   # `
+        }
+
+        for source, target in replacements.items():
+            text = text.replace(
+                source,
+                target,
+            )
+
+        return text
