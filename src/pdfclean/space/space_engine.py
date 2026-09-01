@@ -49,10 +49,16 @@ class TextLine:
     """
     Native PDF text line.
 
-    Spans keep their original horizontal positions.
+    The line keeps the geometry of its original
+    PDF text block.
     """
 
     source_page: int
+
+    block_x0: float
+    block_y0: float
+    block_x1: float
+    block_y1: float
 
     x0: float
     y0: float
@@ -61,10 +67,7 @@ class TextLine:
 
     spans: list[TextItem]
 
-    # Espaces horizontaux entre les spans successifs.
     gaps: list[float]
-
-
 
 @dataclass(slots=True)
 class SpaceBand:
@@ -73,6 +76,15 @@ class SpaceBand:
     """
 
     source_page: int
+
+    # Identifiant du TextBlock source.
+    # Utilisé principalement pour la page 1.
+    block_rect: tuple[
+    float,
+    float,
+    float,
+    float,
+] | None
 
     y0: float
     y1: float
@@ -89,6 +101,14 @@ class OutputBand:
     """
 
     source_page: int
+
+    # Identifiant du TextBlock source.
+    block_rect: tuple[
+    float,
+    float,
+    float,
+    float,
+] | None
 
     source_y0: float
     source_y1: float
@@ -245,6 +265,12 @@ class SpaceEngine:
     ) -> list[list[SpaceBand]]:
         """
         Build meaningful content bands.
+
+        Page 1 is handled separately because the ENI introduction
+        contains positioned text blocks that must keep their original
+        reading order.
+
+        Other pages keep the existing behaviour.
         """
 
         page_blocks: dict[int, list[TextBlock]] = {}
@@ -270,7 +296,9 @@ class SpaceEngine:
 
         result: list[list[SpaceBand]] = []
 
-        for page_number in range(document.page_count):
+        for page_number in range(
+            document.page_count
+        ):
 
             page = document[page_number]
 
@@ -278,6 +306,33 @@ class SpaceEngine:
                 page_number,
                 [],
             )
+
+            # ========================================================
+            # PAGE 1
+            #
+            # Keep the original extraction order.
+            # Do NOT sort by Y/X here.
+            #
+            # This is important for the ENI introduction page where
+            # several text blocks are positioned independently.
+            # ========================================================
+
+            if page_number == 0:
+
+                bands = self._make_page1_bands(
+                    page_number,
+                    page.rect.height,
+                    blocks_on_page,
+                )
+
+                result.append(bands)
+                continue
+
+            # ========================================================
+            # OTHER PAGES
+            #
+            # Existing behaviour remains unchanged.
+            # ========================================================
 
             blocks_on_page.sort(
                 key=lambda block: (
@@ -295,6 +350,58 @@ class SpaceEngine:
             )
 
         return result
+
+    def _make_page1_bands(
+        self,
+        page_number: int,
+        page_height: float,
+        blocks: list[TextBlock],
+    ) -> list[SpaceBand]:
+        """
+        Build bands for the ENI introduction page.
+
+        The block extraction order is deliberately preserved.
+
+        The page contains positioned presentation elements that should
+        not be reordered globally by Y/X.
+        """
+
+        if not blocks:
+            return []
+
+        bands: list[SpaceBand] = []
+
+        for block in blocks:
+
+            y0 = max(
+                0.0,
+                block.y0 - self.CONTENT_PADDING,
+            )
+
+            y1 = min(
+                page_height,
+                block.y1 + self.CONTENT_PADDING,
+            )
+
+            if y1 <= y0:
+                continue
+
+           
+            bands.append(
+                SpaceBand(
+                    source_page=page_number,
+                    block_rect=(
+                        block.x0,
+                        block.y0,
+                        block.x1,
+                        block.y1,
+                    ),
+                    y0=y0,
+                    y1=y1,
+                )
+            )
+
+        return bands
 
     def _make_bands(
         self,
@@ -361,6 +468,7 @@ class SpaceEngine:
         return [
             SpaceBand(
                 source_page=page_number,
+                block_rect=None,
                 y0=y0,
                 y1=y1,
             )
@@ -422,13 +530,24 @@ class SpaceEngine:
                     for title in band_titles
                 )
 
+                # ----------------------------------------------------
+                # Force a new page for a major title.
+                # ----------------------------------------------------
+
                 if (
                     force_new_page
                     and current_page
                 ):
-                    output_pages.append(current_page)
+                    output_pages.append(
+                        current_page
+                    )
+
                     current_page = []
                     cursor = self.TOP_MARGIN
+
+                # ----------------------------------------------------
+                # Normal page overflow.
+                # ----------------------------------------------------
 
                 if (
                     cursor + band.height
@@ -436,20 +555,30 @@ class SpaceEngine:
                 ):
 
                     if current_page:
-                        output_pages.append(current_page)
+                        output_pages.append(
+                            current_page
+                        )
 
                     current_page = []
                     cursor = self.TOP_MARGIN
 
+                # ----------------------------------------------------
+                # Create the output band AFTER all page-breaking
+                # decisions have been made.
+                # ----------------------------------------------------
+
                 output_band = OutputBand(
                     source_page=band.source_page,
+                    block_rect=band.block_rect,
                     source_y0=band.y0,
                     source_y1=band.y1,
                     target_y0=cursor,
                     target_y1=cursor + band.height,
                 )
 
-                current_page.append(output_band)
+                current_page.append(
+                    output_band
+                )
 
                 if abs(
                     band.y0 - cursor
@@ -462,9 +591,11 @@ class SpaceEngine:
                 )
 
         if current_page:
-            output_pages.append(current_page)
+            output_pages.append(
+                current_page
+            )
 
-        return output_pages
+        return output_pages  
 
     # ============================================================
     # TITLE HELPERS
@@ -522,7 +653,6 @@ class SpaceEngine:
     # ============================================================
     # TEXT EXTRACTION
     # ============================================================
-
     def _extract_text_lines(
         self,
         document: fitz.Document,
@@ -531,17 +661,14 @@ class SpaceEngine:
         page_numbers,
     ) -> list[TextLine]:
         """
-        Extract native PDF lines while preserving the original
-        horizontal geometry.
+        Extract native PDF text lines.
 
-        We explicitly detect spaces between spans so that the
-        reconstructed text does not merge words such as:
+        Each TextLine keeps the geometry of its original
+        PDF text block.
 
-            optimisationdu
-
-        or:
-
-            Profileret
+        IMPORTANT:
+            We do not manufacture a block number.
+            The source block rectangle is kept instead.
         """
 
         lines: list[TextLine] = []
@@ -550,16 +677,42 @@ class SpaceEngine:
 
             data = page.get_text("dict")
 
-            for block in data.get("blocks", []):
+            for block in data.get(
+                "blocks",
+                [],
+            ):
 
                 if block.get("type") != 0:
                     continue
 
-                for line in block.get("lines", []):
+                block_bbox = block.get(
+                    "bbox"
+                )
+
+                if not block_bbox:
+                    continue
+
+                (
+                    block_x0,
+                    block_y0,
+                    block_x1,
+                    block_y1,
+                ) = map(
+                    float,
+                    block_bbox,
+                )
+
+                for line in block.get(
+                    "lines",
+                    [],
+                ):
 
                     line_spans: list[TextItem] = []
 
-                    for span in line.get("spans", []):
+                    for span in line.get(
+                        "spans",
+                        [],
+                    ):
 
                         text = str(
                             span.get(
@@ -571,7 +724,9 @@ class SpaceEngine:
                         if not text:
                             continue
 
-                        bbox = span.get("bbox")
+                        bbox = span.get(
+                            "bbox"
+                        )
 
                         if not bbox:
                             continue
@@ -581,7 +736,10 @@ class SpaceEngine:
                             bbox,
                         )
 
-                        if x1 <= x0 or y1 <= y0:
+                        if (
+                            x1 <= x0
+                            or y1 <= y0
+                        ):
                             continue
 
                         span_rect = fitz.Rect(
@@ -632,10 +790,12 @@ class SpaceEngine:
                             flags & 2
                         )
 
-                        color = self._pdf_color_to_rgb(
-                            span.get(
-                                "color",
-                                0,
+                        color = (
+                            self._pdf_color_to_rgb(
+                                span.get(
+                                    "color",
+                                    0,
+                                )
                             )
                         )
 
@@ -659,7 +819,7 @@ class SpaceEngine:
                         continue
 
                     # ------------------------------------------------
-                    # Always process spans from left to right.
+                    # Keep spans in their original left-to-right order.
                     # ------------------------------------------------
 
                     line_spans.sort(
@@ -670,12 +830,10 @@ class SpaceEngine:
                     )
 
                     # ------------------------------------------------
-                    # Determine whether a span needs an explicit
-                    # space before it.
+                    # Detect logical spaces.
                     #
-                    # We use both:
-                    #   1. the original text
-                    #   2. the geometric gap between spans
+                    # IMPORTANT:
+                    # Never modify span.text here.
                     # ------------------------------------------------
 
                     for index in range(
@@ -691,144 +849,26 @@ class SpaceEngine:
                             index
                         ]
 
-                        # ------------------------------------------------
-                        # Determine whether a real word space exists.
-                        #
-                        # We only infer a missing space when the characters
-                        # around the gap are compatible with a word boundary.
-                        # ------------------------------------------------
+                        previous_text = (
+                            previous.text.rstrip()
+                        )
 
-                        previous_text = previous.text.rstrip()
-                        current_text = current.text.lstrip()
+                        current_text = (
+                            current.text.lstrip()
+                        )
 
-                        if not previous_text or not current_text:
+                        if (
+                            not previous_text
+                            or not current_text
+                        ):
                             continue
 
-                        previous_last = previous_text[-1]
-                        current_first = current_text[0]
-
-                        # ------------------------------------------------
-                        # Characters that cannot have a preceding space.
-                        # ------------------------------------------------
-
-                        NO_SPACE_BEFORE = {
-                            ".",
-                            ",",
-                            ";",
-                            ":",
-                            "!",
-                            "?",
-                            "%",
-                            ")",
-                            "]",
-                            "}",
-                            "»",
-                        }
-
-                        # ------------------------------------------------
-                        # Characters that cannot have a following space.
-                        # ------------------------------------------------
-
-                        NO_SPACE_AFTER = {
-                            "(",
-                            "[",
-                            "{",
-                            "«",
-                        }
-
-                        # ------------------------------------------------
-                        # Apostrophe:
-                        #
-                        # "l'analyseur"
-                        # "d'administration"
-                        #
-                        # must NEVER become:
-                        #
-                        # "l' analyseur"
-                        # ------------------------------------------------
-
-                        APOSTROPHES = {
-                            "'",
-                            "’",
-                            "ʼ",
-                            "′",
-                        }
-
-                        # ------------------------------------------------
-                        # First respect explicit spaces present in the
-                        # original extracted text.
-                        # ------------------------------------------------
-
-                        explicit_space = (
-                            previous.text.endswith(" ")
-                            or current.text.startswith(" ")
+                        previous_last = (
+                            previous_text[-1]
                         )
 
-                        # ------------------------------------------------
-                        # Never insert spaces around punctuation or
-                        # apostrophes.
-                        # ------------------------------------------------
-
-                        punctuation_case = (
-                            current_first in NO_SPACE_BEFORE
-                            or previous_last in NO_SPACE_AFTER
-                            or previous_last in APOSTROPHES
-                            or current_first in APOSTROPHES
-                        )
-
-                        if punctuation_case:
-                            current.has_space_before = explicit_space
-                            continue
-
-                        # ------------------------------------------------
-                        # Infer a missing word space geometrically.
-                        #
-                        # Only do this when both sides look like normal
-                        # word characters.
-                        # ------------------------------------------------
-
-                        previous_is_word = (
-                            previous_last.isalnum()
-                            or previous_last in {
-                                "à",
-                                "â",
-                                "ä",
-                                "ç",
-                                "é",
-                                "è",
-                                "ê",
-                                "ë",
-                                "î",
-                                "ï",
-                                "ô",
-                                "ö",
-                                "ù",
-                                "û",
-                                "ü",
-                                "ÿ",
-                            }
-                        )
-
-                        current_is_word = (
-                            current_first.isalnum()
-                            or current_first in {
-                                "à",
-                                "â",
-                                "ä",
-                                "ç",
-                                "é",
-                                "è",
-                                "ê",
-                                "ë",
-                                "î",
-                                "ï",
-                                "ô",
-                                "ö",
-                                "ù",
-                                "û",
-                                "ü",
-                                "ÿ",
-                            }
+                        current_first = (
+                            current_text[0]
                         )
 
                         geometric_gap = (
@@ -836,26 +876,149 @@ class SpaceEngine:
                             - previous.x1
                         )
 
-                        geometric_space = (
-                            previous_is_word
-                            and current_is_word
-                            and geometric_gap
-                            >= max(
-                                1.0,
-                                current.size * 0.30,
+                        no_space_before = {
+                            ".",
+                            ",",
+                            ";",
+                            "%",
+                            ")",
+                            "]",
+                            "}",
+                            "»",
+                        }
+
+                        no_space_after = {
+                            "(",
+                            "[",
+                            "{",
+                            "«",
+                        }
+
+                        apostrophes = {
+                            "'",
+                            "’",
+                            "ʼ",
+                            "′",
+                        }
+
+                        french_space_before = {
+                            ":",
+                            "?",
+                            "!",
+                        }
+
+                        explicit_space = (
+                            previous.text.endswith(
+                                " "
+                            )
+                            or current.text.startswith(
+                                " "
                             )
                         )
 
+                        # ------------------------------------------------
+                        # Apostrophe.
+                        # ------------------------------------------------
+
                         if (
-                            explicit_space
-                            or geometric_space
+                            previous_last
+                            in apostrophes
+                            or current_first
+                            in apostrophes
+                        ):
+                            current.has_space_before = (
+                                explicit_space
+                            )
+                            continue
+
+                        # ------------------------------------------------
+                        # Punctuation without preceding space.
+                        # ------------------------------------------------
+
+                        if (
+                            current_first
+                            in no_space_before
+                        ):
+                            current.has_space_before = (
+                                explicit_space
+                            )
+                            continue
+
+                        # ------------------------------------------------
+                        # Opening punctuation.
+                        # ------------------------------------------------
+
+                        if (
+                            previous_last
+                            in no_space_after
+                        ):
+                            current.has_space_before = (
+                                explicit_space
+                            )
+                            continue
+
+                        # ------------------------------------------------
+                        # French punctuation.
+                        # ------------------------------------------------
+
+                        if (
+                            current_first
+                            in french_space_before
                         ):
                             current.has_space_before = True
+                            continue
 
+                        # ------------------------------------------------
+                        # Normal word separation.
+                        # ------------------------------------------------
+
+                        previous_is_word = (
+                            previous_last.isalnum()
+                        )
+
+                        current_is_word = (
+                            current_first.isalnum()
+                        )
+
+                        if geometric_gap < 0:
+                            current.has_space_before = False
+                            continue
+
+                        geometric_space = (
+                            previous_is_word
+                            and current_is_word
+                            and geometric_gap >= 0.5
+                        )
+
+                        current.has_space_before = (
+                            explicit_space
+                            or geometric_space
+                        )
+
+                    # ------------------------------------------------
+                    # Preserve geometric gaps.
+                    # ------------------------------------------------
+
+                    gaps = [
+                        max(
+                            0.0,
+                            line_spans[i + 1].x0
+                            - line_spans[i].x1,
+                        )
+                        for i in range(
+                            len(line_spans) - 1
+                        )
+                    ]
 
                     lines.append(
                         TextLine(
                             source_page=page_number,
+
+                            block_x0=block_x0,
+                            block_y0=block_y0,
+                            block_x1=block_x1,
+                            block_y1=block_y1,
+
                             x0=min(
                                 span.x0
                                 for span in line_spans
@@ -872,21 +1035,14 @@ class SpaceEngine:
                                 span.y1
                                 for span in line_spans
                             ),
+
                             spans=line_spans,
-                            gaps=[
-                                max(
-                                    0.0,
-                                    line_spans[i + 1].x0
-                                    - line_spans[i].x1,
-                                )
-                                for i in range(
-                                    len(line_spans) - 1
-                                )
-                            ],
+                            gaps=gaps,
                         )
                     )
 
         return lines
+
 
     def _rect_in_excluded_region(
         self,
@@ -1203,21 +1359,16 @@ class SpaceEngine:
         text: str,
     ) -> str:
         """
-        Normalize PDF text characters and remove
-        incorrect spaces around punctuation.
+        Normalize PDF text while preserving French punctuation.
         """
 
-        # --------------------------------------------------------
-        # Normalize apostrophe-like characters.
-        # --------------------------------------------------------
-
         replacements = {
-            "\u2018": "'",   # ‘
-            "\u2019": "'",   # ’
-            "\u201B": "'",   # ‛
-            "\u2032": "'",   # ′
-            "\u00B4": "'",   # ´
-            "\u0060": "'",   # `
+            "\u2018": "'",
+            "\u2019": "'",
+            "\u201B": "'",
+            "\u2032": "'",
+            "\u00B4": "'",
+            "\u0060": "'",
         }
 
         for source, target in replacements.items():
@@ -1226,39 +1377,28 @@ class SpaceEngine:
                 target,
             )
 
-        # --------------------------------------------------------
-        # Remove spaces after apostrophes.
-        #
-        # l' analyseur -> l'analyseur
-        # d' administration -> d'administration
-        # --------------------------------------------------------
-
+        # No space after apostrophe.
         text = re.sub(
             r"'\s+",
             "'",
             text,
         )
 
-        # --------------------------------------------------------
-        # Remove spaces before punctuation.
-        #
-        # performances , -> performances,
-        # données .      -> données.
-        # --------------------------------------------------------
-
+        # No space before comma, period, semicolon or percent.
         text = re.sub(
-            r"\s+([,.;:!?%\)\]\}])",
+            r"\s+([,.;%])",
             r"\1",
             text,
         )
 
-        # --------------------------------------------------------
-        # Remove spaces after opening punctuation.
-        #
-        # ( texte -> (texte
-        # [ texte -> [texte
-        # --------------------------------------------------------
+        # No space before closing punctuation.
+        text = re.sub(
+            r"\s+([\)\]\}»])",
+            r"\1",
+            text,
+        )
 
+        # No space after opening punctuation.
         text = re.sub(
             r"([\(\[\{«])\s+",
             r"\1",
@@ -1266,7 +1406,7 @@ class SpaceEngine:
         )
 
         return text
-
+    
     def _write_output(
         self,
         source: fitz.Document,
@@ -1277,10 +1417,13 @@ class SpaceEngine:
         """
         Create the output PDF.
 
-        Text is inserted as native PDF text.
+        Text remains native PDF text.
 
-        Each source line is inserted once while keeping the
-        original horizontal span positions.
+        Each source line is written once for its matching
+        source-page band.
+
+        Page 1 uses the original source block rectangle
+        to associate a line with its source block.
         """
 
         output = fitz.open()
@@ -1296,66 +1439,102 @@ class SpaceEngine:
 
                 for band in page_bands:
 
-                    # ------------------------------------------------
-                    # Vertical translation applied to this band.
-                    # ------------------------------------------------
+                    if band.source_page == 0:
+
+                        if band.block_rect is None:
+                            continue
+
+                        bx0, by0, bx1, by1 = (
+                            band.block_rect
+                        )
+
+                    else:
+
+                        bx0 = by0 = bx1 = by1 = 0.0
 
                     y_offset = (
                         band.target_y0
                         - band.source_y0
                     )
 
-                    # ------------------------------------------------
-                    # Process only lines belonging to this source page.
-                    # ------------------------------------------------
-
                     for line in text_lines:
 
-                        if line.source_page != band.source_page:
-                            continue
+                        # ------------------------------------------------
+                        # Source page must match.
+                        # ------------------------------------------------
 
                         if (
-                            line.y1 < band.source_y0
-                            or line.y0 > band.source_y1
+                            line.source_page
+                            != band.source_page
                         ):
                             continue
 
-                        y_offset = (
-                            band.target_y0
-                            - band.source_y0
-                        )
+                        # =================================================
+                        # PAGE 1
+                        #
+                        # Associate the line with its original block
+                        # using the stored block rectangle.
+                        # =================================================
+
+                        if band.source_page == 0:
+
+                            if not (
+                                abs(line.block_x0 - bx0) <= 0.5
+                                and
+                                abs(line.block_y0 - by0) <= 0.5
+                                and
+                                abs(line.block_x1 - bx1) <= 0.5
+                                and
+                                abs(line.block_y1 - by1) <= 0.5
+                            ):
+                                continue
+
+                        # =================================================
+                        # OTHER PAGES
+                        # =================================================
+
+                        else:
+
+                            line_center_y = (
+                                line.y0
+                                + line.y1
+                            ) / 2.0
+
+                            if not (
+                                band.source_y0
+                                <= line_center_y
+                                < band.source_y1
+                            ):
+                                continue
+
+                        # ------------------------------------------------
+                        # Vertical translation.
+                        # ------------------------------------------------
 
                         target_baseline = (
                             line.y1
                             + y_offset
                         )
 
-                        for index, span in enumerate(
-                            line.spans
-                        ):
+                        # =================================================
+                        # INSERT SPANS
+                        # =================================================
 
-                            text = span.text
+                        for span in line.spans:
 
-                            # --------------------------------------------------------
-                            # Preserve an explicit word separator.
-                            # --------------------------------------------------------
-
-                            if (
-                                index > 0
-                                and span.has_space_before
-                                and not text.startswith(" ")
-                            ):
-                                text = " " + text
-
-                            fontname = self._get_output_font(
-                                source,
-                                band.source_page,
-                                span.font,
-                                target_page,
+                            text = (
+                                self._normalize_pdf_text(
+                                    span.text
+                                )
                             )
 
-                            text = self._normalize_pdf_text(
-                                text
+                            fontname = (
+                                self._get_output_font(
+                                    source,
+                                    line.source_page,
+                                    span.font,
+                                    target_page,
+                                )
                             )
 
                             try:
@@ -1374,6 +1553,14 @@ class SpaceEngine:
 
                             except Exception:
 
+                                fallback_font = (
+                                    self._safe_font(
+                                        span.font,
+                                        span.bold,
+                                        span.italic,
+                                    )
+                                )
+
                                 target_page.insert_text(
                                     (
                                         span.x0,
@@ -1381,17 +1568,14 @@ class SpaceEngine:
                                     ),
                                     text,
                                     fontsize=span.size,
-                                    fontname=self._safe_font(
-                                        span.font,
-                                        span.bold,
-                                        span.italic,
-                                    ),
+                                    fontname=fallback_font,
                                     color=span.color,
                                     overlay=True,
                                 )
 
-
-            self._pages_created = len(output)
+            self._pages_created = len(
+                output
+            )
 
             output.save(
                 output_path,
@@ -1402,8 +1586,7 @@ class SpaceEngine:
 
         finally:
             output.close()
-
-
+    
     def _safe_font(
         self,
         font: str,
@@ -1511,59 +1694,3 @@ class SpaceEngine:
             footers,
             page_numbers,
         )
-
-def _normalize_pdf_text(
-    self,
-    text: str,
-) -> str:
-    """
-    Normalize PDF text characters and remove
-    incorrect spaces around punctuation.
-    """
-
-    replacements = {
-        "\u2018": "'",
-        "\u2019": "'",
-        "\u201B": "'",
-        "\u2032": "'",
-        "\u00B4": "'",
-        "\u0060": "'",
-    }
-
-    for source, target in replacements.items():
-        text = text.replace(
-            source,
-            target,
-        )
-
-    # ------------------------------------------------
-    # Never leave a space after an apostrophe.
-    # ------------------------------------------------
-
-    text = re.sub(
-        r"(['’])\s+",
-        r"\1",
-        text,
-    )
-
-    # ------------------------------------------------
-    # Never leave a space before punctuation.
-    # ------------------------------------------------
-
-    text = re.sub(
-        r"\s+([,.;:!?%\)\]\}])",
-        r"\1",
-        text,
-    )
-
-    # ------------------------------------------------
-    # No space immediately after opening punctuation.
-    # ------------------------------------------------
-
-    text = re.sub(
-        r"([\(\[\{«])\s+",
-        r"\1",
-        text,
-    )
-
-    return text
